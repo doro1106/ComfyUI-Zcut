@@ -1,0 +1,13 @@
+transformers>=4.39.0
+timm
+opencv-python
+Pillow
+numpy
+safetensors
+huggingface-hub>=0.19.0
+hf-xet
+iopath>=0.1.9
+ftfy
+regex
+typing_extensions
+scipy
