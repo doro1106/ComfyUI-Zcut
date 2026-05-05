@@ -1,4 +1,6 @@
 import importlib.util
+import logging
+import math
 import os
 import shutil
 import sys
@@ -22,6 +24,7 @@ SAM3_CHECKPOINT = SAM3_DIR / "sam3.pt"
 SAM3_BPE_PATH = SAM3_DIR / "assets" / "bpe_simple_vocab_16e6.txt.gz"
 BIREFNET_HF_REPO = os.environ.get("ZCUT_BIREFNET_HF_REPO", "1038lab/BiRefNet")
 SAM3_HF_REPOS = [repo.strip() for repo in os.environ.get("ZCUT_SAM3_HF_REPOS", "facebook/sam3,AB498/sam3").split(",") if repo.strip()]
+UPSCALE_METHODS = ["nearest-exact", "bilinear", "area", "bicubic", "lanczos"]
 
 BIREFNET_MODEL_CANDIDATES = {
     "BiRefNet-portrait": ("birefnet.py", "BiRefNet-portrait.safetensors", 1024),
@@ -58,6 +61,37 @@ def _tensor_to_numpy_batch(image):
     return np.clip(arr * 255.0, 0, 255).astype(np.uint8)
 
 
+def _tensor_to_rgb_alpha_batch(image):
+    arr = image.detach().cpu().numpy()
+    if arr.ndim == 3:
+        arr = arr[None,]
+    arr = np.clip(arr, 0.0, 1.0).astype(np.float32)
+
+    if arr.shape[-1] >= 4:
+        alpha = arr[..., 3]
+    else:
+        alpha = np.ones(arr.shape[:3], dtype=np.float32)
+
+    rgb = arr[..., :3]
+    if rgb.shape[-1] == 1:
+        rgb = np.repeat(rgb, 3, axis=-1)
+    elif rgb.shape[-1] < 3:
+        pad = np.zeros((*rgb.shape[:-1], 3 - rgb.shape[-1]), dtype=rgb.dtype)
+        rgb = np.concatenate((rgb, pad), axis=-1)
+
+    return np.clip(rgb * 255.0, 0, 255).astype(np.uint8), np.clip(alpha, 0.0, 1.0).astype(np.float32)
+
+
+def _tensor_has_alpha_channel(image):
+    arr = image.detach().cpu()
+    return arr.ndim >= 3 and arr.shape[-1] >= 4
+
+
+def _image_to_rgb_alpha_for_upscale(image):
+    rgb_batch, image_alpha = _tensor_to_rgb_alpha_batch(image)
+    return rgb_batch, image_alpha, _tensor_has_alpha_channel(image)
+
+
 def _numpy_batch_to_tensor(images):
     arr = np.stack(images, axis=0).astype(np.float32) / 255.0
     return torch.from_numpy(arr)
@@ -68,8 +102,29 @@ def _mask_batch_to_tensor(masks):
     return torch.from_numpy(arr)
 
 
+def _mask_to_numpy_batch(mask):
+    arr = mask.detach().cpu().numpy()
+    if arr.ndim == 2:
+        arr = arr[None,]
+    return np.clip(arr, 0.0, 1.0).astype(np.float32)
+
+
 def _resize_mask(mask, width, height):
     return cv2.resize(mask, (width, height), interpolation=cv2.INTER_LINEAR)
+
+
+def _cv2_interpolation(method):
+    if method == "nearest-exact":
+        return getattr(cv2, "INTER_NEAREST_EXACT", cv2.INTER_NEAREST)
+    if method == "bilinear":
+        return cv2.INTER_LINEAR
+    if method == "area":
+        return cv2.INTER_AREA
+    if method == "bicubic":
+        return cv2.INTER_CUBIC
+    if method == "lanczos":
+        return cv2.INTER_LANCZOS4
+    return cv2.INTER_LINEAR
 
 
 def _load_module(module_name, path):
@@ -78,6 +133,94 @@ def _load_module(module_name, path):
     sys.modules[module_name] = module
     spec.loader.exec_module(module)
     return module
+
+
+def _available_upscale_models():
+    try:
+        import folder_paths
+
+        models = folder_paths.get_filename_list("upscale_models")
+        return models or ["none"]
+    except Exception:
+        return ["none"]
+
+
+@lru_cache(maxsize=4)
+def _load_upscale_model(model_name):
+    if model_name == "none":
+        raise ValueError("No upscale model is selected or available.")
+
+    import comfy.utils
+    import folder_paths
+    from spandrel import ImageModelDescriptor, ModelLoader
+
+    try:
+        from spandrel import MAIN_REGISTRY
+        from spandrel_extra_arches import EXTRA_REGISTRY
+
+        MAIN_REGISTRY.add(*EXTRA_REGISTRY)
+    except Exception:
+        logging.debug("[Zcut] spandrel_extra_arches is not available.", exc_info=True)
+
+    model_path = folder_paths.get_full_path_or_raise("upscale_models", model_name)
+    state_dict = comfy.utils.load_torch_file(model_path, safe_load=True)
+    if "module.layers.0.residual_group.blocks.0.norm1.weight" in state_dict:
+        state_dict = comfy.utils.state_dict_prefix_replace(state_dict, {"module.": ""})
+
+    model = ModelLoader().load_from_state_dict(state_dict).eval()
+    if not isinstance(model, ImageModelDescriptor):
+        raise RuntimeError("Upscale model must be a single-image model.")
+    return model
+
+
+def _apply_upscale_model(upscale_model, image):
+    import comfy.model_management as model_management
+    import comfy.utils
+
+    device = model_management.get_torch_device()
+    memory_required = model_management.module_size(upscale_model.model)
+    memory_required += (512 * 512 * 3) * image.element_size() * max(upscale_model.scale, 1.0) * 384.0
+    memory_required += image.nelement() * image.element_size()
+    model_management.free_memory(memory_required, device)
+
+    upscale_model.to(device)
+    in_img = image.movedim(-1, -3).to(device)
+    tile = 512
+    overlap = 32
+    output_device = model_management.intermediate_device()
+
+    oom = True
+    try:
+        while oom:
+            try:
+                steps = in_img.shape[0] * comfy.utils.get_tiled_scale_steps(
+                    in_img.shape[3],
+                    in_img.shape[2],
+                    tile_x=tile,
+                    tile_y=tile,
+                    overlap=overlap,
+                )
+                progress = comfy.utils.ProgressBar(steps)
+                scaled = comfy.utils.tiled_scale(
+                    in_img,
+                    lambda tile_image: upscale_model(tile_image.float()),
+                    tile_x=tile,
+                    tile_y=tile,
+                    overlap=overlap,
+                    upscale_amount=upscale_model.scale,
+                    pbar=progress,
+                    output_device=output_device,
+                )
+                oom = False
+            except Exception as exc:
+                model_management.raise_non_oom(exc)
+                tile //= 2
+                if tile < 128:
+                    raise exc
+    finally:
+        upscale_model.to("cpu")
+
+    return torch.clamp(scaled.movedim(-3, -1), min=0.0, max=1.0).detach().cpu()
 
 
 def _path_is_relative_to(path, parent):
@@ -370,13 +513,21 @@ def _crop_mask(mask, box, crop_width, crop_height):
     return _resize_mask(cropped, crop_width, crop_height)
 
 
-def _shape_mask(width, height, shape):
+def _shape_mask(width, height, shape, feather_px=0):
     mask = np.ones((height, width), dtype=np.float32)
+    feather_margin = max(0, int(feather_px) * 2)
+    if shape == "square" and feather_margin > 0:
+        left = min(feather_margin, max(width // 2, 0))
+        right = max(width - feather_margin, left)
+        top = min(feather_margin, max(height // 2, 0))
+        bottom = max(height - feather_margin, top)
+        mask = np.zeros((height, width), dtype=np.float32)
+        mask[top:bottom, left:right] = 1.0
     if shape == "circle":
         yy, xx = np.ogrid[:height, :width]
         cx = (width - 1) * 0.5
         cy = (height - 1) * 0.5
-        radius = min(width, height) * 0.5
+        radius = max(0.0, min(width, height) * 0.5 - feather_margin)
         mask = (((xx - cx) ** 2 + (yy - cy) ** 2) <= radius**2).astype(np.float32)
     return mask
 
@@ -406,9 +557,87 @@ def _clean_subject_mask(mask):
     return (mask >= 0.5).astype(np.float32)
 
 
-def _rgba_from_rgb_and_alpha(rgb, alpha):
+def _nearest_opaque_rgb_fill(rgb, alpha, threshold=0.01):
+    rgb = rgb.astype(np.uint8, copy=True)
+    alpha = np.clip(alpha, 0.0, 1.0).astype(np.float32)
+    opaque = alpha > threshold
+    if opaque.all() or not opaque.any():
+        rgb[~opaque] = 0
+        return rgb
+
+    _, labels = cv2.distanceTransformWithLabels(
+        (~opaque).astype(np.uint8),
+        cv2.DIST_L2,
+        3,
+        labelType=cv2.DIST_LABEL_PIXEL,
+    )
+    coords = np.column_stack(np.where(opaque))
+    nearest = coords[labels - 1]
+    filled = rgb.copy()
+    transparent = ~opaque
+    filled[transparent] = rgb[nearest[transparent, 0], nearest[transparent, 1]]
+    return filled
+
+
+def _replace_edge_rgb_from_interior(rgb, alpha, edge_px=2, threshold=0.5):
+    edge_px = int(edge_px)
+    if edge_px <= 0:
+        return rgb.astype(np.uint8, copy=True)
+
+    rgb = rgb.astype(np.uint8, copy=True)
+    alpha = np.clip(alpha, 0.0, 1.0).astype(np.float32)
+    opaque = alpha > threshold
+    if not opaque.any():
+        return rgb
+
+    distance_inside = cv2.distanceTransform(opaque.astype(np.uint8), cv2.DIST_L2, 3)
+    edge = opaque & (distance_inside <= edge_px)
+    interior = opaque & (distance_inside > edge_px)
+    if not edge.any() or not interior.any():
+        return rgb
+
+    _, labels = cv2.distanceTransformWithLabels(
+        (~interior).astype(np.uint8),
+        cv2.DIST_L2,
+        3,
+        labelType=cv2.DIST_LABEL_PIXEL,
+    )
+    coords = np.column_stack(np.where(interior))
+    nearest = coords[labels - 1]
+    cleaned = rgb.copy()
+    cleaned[edge] = rgb[nearest[edge, 0], nearest[edge, 1]]
+    return cleaned
+
+
+def _rgba_from_rgb_and_alpha(rgb, alpha, defringe_px=0, defringe_alpha=None):
+    defringe_alpha = alpha if defringe_alpha is None else defringe_alpha
     alpha_u8 = np.clip(alpha * 255.0, 0, 255).astype(np.uint8)
-    return np.dstack((rgb, alpha_u8))
+    clean_rgb = _nearest_opaque_rgb_fill(rgb, alpha)
+    clean_rgb = _replace_edge_rgb_from_interior(clean_rgb, defringe_alpha, defringe_px)
+    clean_rgb[alpha <= 0.0] = 0
+    return np.dstack((clean_rgb, alpha_u8))
+
+
+def _resize_array_exact(arr, width, height, method):
+    return cv2.resize(arr, (int(width), int(height)), interpolation=_cv2_interpolation(method))
+
+
+def _resize_rgba_exact(rgba, output_width, output_height, method):
+    alpha = np.clip(rgba[..., 3], 0.0, 1.0).astype(np.float32)
+    rgb = np.clip(rgba[..., :3], 0.0, 1.0).astype(np.float32)
+    premultiplied = rgb * alpha[..., None]
+
+    resized_rgb = _resize_array_exact(premultiplied, output_width, output_height, method)
+    resized_alpha = _resize_array_exact(alpha, output_width, output_height, method)
+    safe_alpha = np.maximum(resized_alpha, 1e-6)
+    straight_rgb = resized_rgb / safe_alpha[..., None]
+    straight_rgb[resized_alpha <= 1e-6] = 0.0
+
+    return np.dstack((np.clip(straight_rgb, 0.0, 1.0), np.clip(resized_alpha, 0.0, 1.0))).astype(np.float32)
+
+
+def _resize_rgb_exact(rgb, output_width, output_height, method):
+    return np.clip(_resize_array_exact(rgb, output_width, output_height, method), 0.0, 1.0).astype(np.float32)
 
 
 def _resize_to_canvas(arr, output_width, output_height, interpolation, pad_value=0):
@@ -430,13 +659,30 @@ def _resize_to_canvas(arr, output_width, output_height, interpolation, pad_value
     return canvas
 
 
+def _resize_rgba_to_canvas(img, output_width, output_height):
+    interpolation = cv2.INTER_AREA if img.shape[0] > output_height else cv2.INTER_LINEAR
+    alpha = np.clip(img[..., 3], 0.0, 1.0)
+    rgb = np.clip(img[..., :3], 0.0, 1.0)
+    premultiplied = rgb * alpha[..., None]
+
+    resized_rgb = _resize_to_canvas(premultiplied, output_width, output_height, interpolation)
+    resized_alpha = _resize_to_canvas(alpha, output_width, output_height, interpolation)
+    safe_alpha = np.maximum(resized_alpha, 1e-6)
+    straight_rgb = resized_rgb / safe_alpha[..., None]
+    straight_rgb[resized_alpha <= 1e-6] = 0.0
+
+    return np.dstack((np.clip(straight_rgb, 0.0, 1.0), np.clip(resized_alpha, 0.0, 1.0)))
+
+
 def _resize_image_batch_to_canvas(image, output_width, output_height):
     arr = image.detach().cpu().numpy()
     if arr.ndim == 3:
         arr = arr[None,]
     arr = np.clip(arr, 0.0, 1.0).astype(np.float32)
     resized = [
-        _resize_to_canvas(img, output_width, output_height, cv2.INTER_AREA if img.shape[0] > output_height else cv2.INTER_LINEAR)
+        _resize_rgba_to_canvas(img, output_width, output_height)
+        if img.shape[-1] >= 4
+        else _resize_to_canvas(img, output_width, output_height, cv2.INTER_AREA if img.shape[0] > output_height else cv2.INTER_LINEAR)
         for img in arr
     ]
     return torch.from_numpy(np.stack(resized, axis=0).astype(np.float32))
@@ -478,11 +724,15 @@ class ZcutBiRefNetSAM3FaceCrop:
                 "birefnet_threshold": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01}),
                 "sam3_prompt": ("STRING", {"default": "face, head, anime face, game character face"}),
                 "sam3_confidence": ("FLOAT", {"default": 0.35, "min": 0.05, "max": 0.95, "step": 0.01}),
-            }
+                "enable_cutout": ("BOOLEAN", {"default": True}),
+            },
+            "optional": {
+                "source_transparency_mask": ("MASK",),
+            },
         }
 
-    RETURN_TYPES = ("IMAGE", "MASK", "MASK")
-    RETURN_NAMES = ("cropped_image", "crop_mask", "birefnet_mask")
+    RETURN_TYPES = ("IMAGE", "MASK", "MASK", "MASK")
+    RETURN_NAMES = ("cropped_image", "crop_mask", "birefnet_mask", "shape_mask")
     FUNCTION = "run"
     CATEGORY = "Zcut"
 
@@ -499,30 +749,323 @@ class ZcutBiRefNetSAM3FaceCrop:
         birefnet_threshold,
         sam3_prompt,
         sam3_confidence,
+        enable_cutout,
+        source_transparency_mask=None,
     ):
         cropped_images = []
         crop_masks = []
         birefnet_masks = []
-        shape_mask = _shape_mask(crop_width, crop_height, shape)
+        shape_masks = []
+        shape_feather_px = feather_px if feather_edges else 0
+        shape_mask = _shape_mask(crop_width, crop_height, shape, shape_feather_px)
         if feather_edges:
             shape_mask = np.clip(_feather_shape_mask(shape_mask, feather_px), 0.0, 1.0)
 
-        for rgb in _tensor_to_numpy_batch(image):
-            subject_mask = _run_birefnet(rgb, birefnet_model, birefnet_threshold, device)
+        rgb_batch, alpha_batch = _tensor_to_rgb_alpha_batch(image)
+        transparency_batch = _mask_to_numpy_batch(source_transparency_mask) if source_transparency_mask is not None else None
+
+        for idx, (rgb, image_alpha) in enumerate(zip(rgb_batch, alpha_batch)):
+            source_alpha = image_alpha
+            if transparency_batch is not None:
+                transparency_mask = transparency_batch[min(idx, len(transparency_batch) - 1)]
+                if transparency_mask.shape != image_alpha.shape:
+                    transparency_mask = _resize_mask(transparency_mask, rgb.shape[1], rgb.shape[0])
+                source_alpha = 1.0 - np.clip(transparency_mask, 0.0, 1.0)
+
+            if enable_cutout:
+                birefnet_mask = _run_birefnet(rgb, birefnet_model, birefnet_threshold, device)
+                subject_mask = np.clip(birefnet_mask * source_alpha, 0.0, 1.0).astype(np.float32)
+            else:
+                subject_mask = np.clip(source_alpha, 0.0, 1.0).astype(np.float32)
+                birefnet_mask = subject_mask
+
             center = _choose_face_center(rgb, subject_mask, sam3_prompt, sam3_confidence, device)
             cropped_rgb, crop_box = _crop_around_center(rgb, center, crop_width, crop_height)
-            cropped_subject = _crop_mask(subject_mask, crop_box, crop_width, crop_height)
-            cropped_subject = _clean_subject_mask(cropped_subject)
-            final_mask = np.clip(cropped_subject * shape_mask, 0.0, 1.0)
-            cropped_images.append(_rgba_from_rgb_and_alpha(cropped_rgb, final_mask))
+            cropped_source_alpha = _crop_mask(source_alpha, crop_box, crop_width, crop_height)
+            cropped_base_mask = _crop_mask(subject_mask, crop_box, crop_width, crop_height)
+            if enable_cutout:
+                cropped_base_mask = _clean_subject_mask(cropped_base_mask)
+            final_mask = np.clip(cropped_base_mask * shape_mask, 0.0, 1.0)
+            defringe_alpha = cropped_base_mask if enable_cutout else cropped_source_alpha
+            defringe_enabled = enable_cutout or np.any((cropped_source_alpha > 0.0) & (cropped_source_alpha < 1.0))
+            cropped_images.append(
+                _rgba_from_rgb_and_alpha(
+                    cropped_rgb,
+                    final_mask,
+                    defringe_px=2 if defringe_enabled else 0,
+                    defringe_alpha=defringe_alpha,
+                )
+            )
             crop_masks.append(final_mask)
-            birefnet_masks.append(subject_mask)
+            birefnet_masks.append(birefnet_mask)
+            shape_masks.append(shape_mask)
 
         return (
             _numpy_batch_to_tensor(cropped_images),
             _mask_batch_to_tensor(crop_masks),
             _mask_batch_to_tensor(birefnet_masks),
+            _mask_batch_to_tensor(shape_masks),
         )
+
+
+def _round_dimension_to_multiple(value, multiple):
+    value = max(1, int(round(value)))
+    multiple = int(multiple)
+    if multiple <= 1:
+        return value
+    return max(1, int(round(value / multiple) * multiple))
+
+
+def _target_dimensions(width, height, mode, rescale_factor, resize_mode, resize_size, round_to_multiple):
+    width = max(1, int(width))
+    height = max(1, int(height))
+
+    if mode == "rescale":
+        target_width = width * float(rescale_factor)
+        target_height = height * float(rescale_factor)
+    else:
+        resize_size = max(1, int(resize_size))
+        if resize_mode == "width":
+            target_width = resize_size
+            target_height = height * (resize_size / width)
+        elif resize_mode == "height":
+            target_height = resize_size
+            target_width = width * (resize_size / height)
+        else:
+            longest = max(width, height)
+            scale = resize_size / longest
+            target_width = width * scale
+            target_height = height * scale
+
+    return (
+        _round_dimension_to_multiple(target_width, round_to_multiple),
+        _round_dimension_to_multiple(target_height, round_to_multiple),
+    )
+
+
+def _clean_rgb_for_alpha(rgb_batch, alpha_batch):
+    cleaned = []
+    for rgb, alpha in zip(rgb_batch, alpha_batch):
+        cleaned.append(_nearest_opaque_rgb_fill(rgb, alpha).astype(np.float32) / 255.0)
+    return np.stack(cleaned, axis=0).astype(np.float32)
+
+
+def _premultiply_rgb_by_alpha(rgb_batch, alpha_batch):
+    return np.clip(rgb_batch, 0.0, 1.0).astype(np.float32) * np.clip(alpha_batch, 0.0, 1.0).astype(np.float32)[..., None]
+
+
+def _unpremultiply_rgb_by_alpha(rgb_batch, alpha_batch, epsilon=1e-6):
+    alpha = np.clip(alpha_batch, 0.0, 1.0).astype(np.float32)
+    rgb = np.clip(rgb_batch, 0.0, 1.0).astype(np.float32)
+    out = rgb / np.maximum(alpha, epsilon)[..., None]
+    out[alpha <= epsilon] = 0.0
+    return np.clip(out, 0.0, 1.0).astype(np.float32)
+
+
+def _clear_rgb_where_transparent(rgb_batch, alpha_batch, epsilon=1e-6):
+    rgb = np.clip(rgb_batch, 0.0, 1.0).astype(np.float32).copy()
+    alpha = np.clip(alpha_batch, 0.0, 1.0).astype(np.float32)
+    rgb[alpha <= epsilon] = 0.0
+    return rgb
+
+
+def _resize_rgba_batch_exact(rgb_batch, alpha_batch, output_width, output_height, method):
+    images = []
+    masks = []
+    for rgb, alpha in zip(rgb_batch, alpha_batch):
+        rgba = np.dstack((np.clip(rgb, 0.0, 1.0), np.clip(alpha, 0.0, 1.0)))
+        resized = _resize_rgba_exact(rgba, output_width, output_height, method)
+        resized_rgb = resized[..., :3]
+        resized_rgb[resized[..., 3] <= 0.0] = 0.0
+        resized[..., :3] = resized_rgb
+        images.append(resized)
+        masks.append(resized[..., 3])
+    return (
+        torch.from_numpy(np.stack(images, axis=0).astype(np.float32)),
+        torch.from_numpy(np.stack(masks, axis=0).astype(np.float32)),
+    )
+
+
+def _color_to_rgb(color):
+    if isinstance(color, str):
+        color = color.strip()
+        if len(color) != 7 or color[0] != "#":
+            raise ValueError("background_color must be #RRGGBB or RGB int.")
+        try:
+            return np.array(
+                [
+                    int(color[1:3], 16) / 255.0,
+                    int(color[3:5], 16) / 255.0,
+                    int(color[5:7], 16) / 255.0,
+                ],
+                dtype=np.float32,
+            )
+        except ValueError as exc:
+            raise ValueError("background_color must be #RRGGBB or RGB int.") from exc
+
+    color = int(color)
+    return np.array(
+        [
+            ((color >> 16) & 0xFF) / 255.0,
+            ((color >> 8) & 0xFF) / 255.0,
+            (color & 0xFF) / 255.0,
+        ],
+        dtype=np.float32,
+    )
+
+
+def _image_tensor_to_rgba_float(image):
+    rgb_u8, alpha_batch = _tensor_to_rgb_alpha_batch(image)
+    rgb = rgb_u8.astype(np.float32) / 255.0
+    return np.concatenate((rgb, alpha_batch[..., None]), axis=-1).astype(np.float32)
+
+
+def _resize_background_rgba(bg, output_width, output_height, fit):
+    bg_height, bg_width = bg.shape[:2]
+    output_width = max(1, int(output_width))
+    output_height = max(1, int(output_height))
+
+    if fit == "stretch":
+        return _resize_rgba_exact(bg, output_width, output_height, "lanczos")
+
+    scale = max(output_width / max(1, bg_width), output_height / max(1, bg_height))
+    resized_width = max(1, int(round(bg_width * scale)))
+    resized_height = max(1, int(round(bg_height * scale)))
+    resized = _resize_rgba_exact(bg, resized_width, resized_height, "lanczos")
+    left = max(0, (resized_width - output_width) // 2)
+    top = max(0, (resized_height - output_height) // 2)
+    return resized[top : top + output_height, left : left + output_width]
+
+
+def _background_image_batch(background_image, batch_size, output_width, output_height, fit):
+    if background_image is None:
+        return np.zeros((batch_size, output_height, output_width, 3), dtype=np.float32)
+
+    backgrounds_rgba = _image_tensor_to_rgba_float(background_image)
+    backgrounds = []
+    for idx in range(batch_size):
+        bg_idx = min(idx, len(backgrounds_rgba) - 1)
+        resized = _resize_background_rgba(backgrounds_rgba[bg_idx], output_width, output_height, fit)
+        rgb = _clear_rgb_where_transparent(resized[None, ..., :3], resized[None, ..., 3])[0]
+        backgrounds.append(rgb)
+    return np.stack(backgrounds, axis=0).astype(np.float32)
+
+
+def _mask_to_size_batch(mask, batch_size, width, height):
+    if mask is None:
+        return np.ones((batch_size, height, width), dtype=np.float32)
+
+    mask_batch = _mask_to_numpy_batch(mask)
+    fixed = []
+    for idx in range(batch_size):
+        single = mask_batch[min(idx, len(mask_batch) - 1)]
+        if single.shape != (height, width):
+            single = _resize_mask(single, width, height)
+        fixed.append(np.clip(single, 0.0, 1.0))
+    return np.stack(fixed, axis=0).astype(np.float32)
+
+
+def _composite_subject_over_background_mask(subject_rgb, subject_alpha, background_rgb, background_mask):
+    bg_alpha = np.clip(background_mask, 0.0, 1.0).astype(np.float32)
+    src_alpha = np.clip(subject_alpha, 0.0, 1.0).astype(np.float32)
+    out_alpha = src_alpha + bg_alpha * (1.0 - src_alpha)
+    premultiplied = subject_rgb * src_alpha[..., None] + background_rgb * bg_alpha[..., None] * (1.0 - src_alpha[..., None])
+    out_rgb = premultiplied / np.maximum(out_alpha, 1e-6)[..., None]
+    out_rgb[out_alpha <= 1e-6] = 0.0
+    return np.clip(out_rgb, 0.0, 1.0).astype(np.float32), np.clip(out_alpha, 0.0, 1.0).astype(np.float32)
+
+
+class ZcutModelUpscale:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+                "upscale_model": (_available_upscale_models(),),
+                "mode": (["rescale", "resize"], {"default": "rescale"}),
+                "rescale_factor": ("FLOAT", {"default": 1.0, "min": 0.01, "max": 16.0, "step": 0.01}),
+                "resize_mode": (["longest_side", "width", "height"], {"default": "longest_side"}),
+                "resize_size": ("INT", {"default": 1024, "min": 1, "max": 16384, "step": 1}),
+                "resample_method": (UPSCALE_METHODS, {"default": "lanczos"}),
+                "supersample": ("BOOLEAN", {"default": True}),
+                "round_to_multiple": ("INT", {"default": 8, "min": 1, "max": 256, "step": 1}),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE", "MASK")
+    RETURN_NAMES = ("upscaled_image", "upscaled_mask")
+    FUNCTION = "run"
+    CATEGORY = "Zcut"
+
+    def run(
+        self,
+        image,
+        upscale_model,
+        mode,
+        rescale_factor,
+        resize_mode,
+        resize_size,
+        resample_method,
+        supersample,
+        round_to_multiple,
+    ):
+        rgb_u8, alpha_batch, has_alpha_input = _image_to_rgb_alpha_for_upscale(image)
+        input_height, input_width = rgb_u8.shape[1:3]
+        target_width, target_height = _target_dimensions(
+            input_width,
+            input_height,
+            mode,
+            rescale_factor,
+            resize_mode,
+            resize_size,
+            round_to_multiple,
+        )
+
+        clean_rgb = _clean_rgb_for_alpha(rgb_u8, alpha_batch)
+        has_transparency = has_alpha_input or np.any(alpha_batch < 0.999)
+        needs_model = target_width > input_width or target_height > input_height
+
+        if needs_model:
+            model = _load_upscale_model(upscale_model)
+            model_alpha = alpha_batch.astype(np.float32)
+            model_rgb_np = _premultiply_rgb_by_alpha(clean_rgb, model_alpha) if has_transparency else clean_rgb.astype(np.float32)
+            model_rgb = torch.from_numpy(model_rgb_np.astype(np.float32))
+
+            while True:
+                prev_height, prev_width = model_rgb.shape[1:3]
+                model_rgb = _apply_upscale_model(model, model_rgb)
+                current_height, current_width = model_rgb.shape[1:3]
+                model_alpha = np.stack(
+                    [
+                        _resize_array_exact(alpha, current_width, current_height, resample_method)
+                        for alpha in model_alpha
+                    ],
+                    axis=0,
+                ).astype(np.float32)
+                if has_transparency:
+                    model_rgb_np = _clear_rgb_where_transparent(model_rgb.detach().cpu().numpy(), model_alpha)
+                    model_rgb = torch.from_numpy(model_rgb_np.astype(np.float32))
+                if (
+                    not supersample
+                    or (current_width >= target_width and current_height >= target_height)
+                    or (current_width <= prev_width and current_height <= prev_height)
+                ):
+                    break
+
+            output_rgb = model_rgb.detach().cpu().numpy()
+            if has_transparency:
+                output_rgb = _unpremultiply_rgb_by_alpha(output_rgb, model_alpha)
+            result_image, result_mask = _resize_rgba_batch_exact(
+                output_rgb,
+                model_alpha,
+                target_width,
+                target_height,
+                resample_method,
+            )
+            return result_image, result_mask
+
+        result_image, result_mask = _resize_rgba_batch_exact(clean_rgb, alpha_batch, target_width, target_height, resample_method)
+        return result_image, result_mask
 
 
 class ZcutResizeOutput:
@@ -551,12 +1094,75 @@ class ZcutResizeOutput:
         return resized_image, resized_mask
 
 
+class ZcutAddBackground:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+                "background_mode": (["transparent", "image", "color"], {"default": "transparent"}),
+                "background_color": ("COLOR", {"default": "#ffffff"}),
+                "background_fit": (["cover", "stretch"], {"default": "cover"}),
+            },
+            "optional": {
+                "background_mask": ("MASK",),
+                "background_image": ("IMAGE",),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE", "MASK")
+    RETURN_NAMES = ("image", "mask")
+    FUNCTION = "run"
+    CATEGORY = "Zcut"
+
+    def run(
+        self,
+        image,
+        background_mode,
+        background_color,
+        background_fit,
+        background_mask=None,
+        background_image=None,
+    ):
+        rgba = _image_tensor_to_rgba_float(image)
+        alpha = np.clip(rgba[..., 3], 0.0, 1.0).astype(np.float32)
+        if not np.any(alpha < 0.999):
+            return image, torch.from_numpy(alpha.astype(np.float32))
+
+        rgb = np.clip(rgba[..., :3], 0.0, 1.0).astype(np.float32)
+        batch_size, height, width = rgb.shape[:3]
+        shape_mask_batch = _mask_to_size_batch(background_mask, batch_size, width, height)
+
+        if background_mode == "transparent":
+            rgb = _clear_rgb_where_transparent(rgb, alpha)
+            out = np.concatenate((rgb, alpha[..., None]), axis=-1).astype(np.float32)
+            return torch.from_numpy(out), torch.from_numpy(alpha.astype(np.float32))
+
+        if background_mode == "image" and background_image is not None:
+            background_rgb = _background_image_batch(background_image, batch_size, width, height, background_fit)
+        elif background_mode == "image":
+            rgb = _clear_rgb_where_transparent(rgb, alpha)
+            out = np.concatenate((rgb, alpha[..., None]), axis=-1).astype(np.float32)
+            return torch.from_numpy(out), torch.from_numpy(alpha.astype(np.float32))
+        else:
+            fill_rgb = _color_to_rgb(background_color)
+            background_rgb = np.broadcast_to(fill_rgb, (batch_size, height, width, 3)).copy()
+
+        out_rgb, out_alpha = _composite_subject_over_background_mask(rgb, alpha, background_rgb, shape_mask_batch)
+        out = np.concatenate((out_rgb, out_alpha[..., None]), axis=-1).astype(np.float32)
+        return torch.from_numpy(out), torch.from_numpy(out_alpha)
+
+
 NODE_CLASS_MAPPINGS = {
     "ZcutBiRefNetSAM3FaceCrop": ZcutBiRefNetSAM3FaceCrop,
+    "ZcutAddBackground": ZcutAddBackground,
+    "ZcutModelUpscale": ZcutModelUpscale,
     "ZcutResizeOutput": ZcutResizeOutput,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "ZcutBiRefNetSAM3FaceCrop": "Zcut BiRefNet SAM3 Face Crop",
+    "ZcutAddBackground": "Zcut Add Background",
+    "ZcutModelUpscale": "Zcut Image Upscale",
     "ZcutResizeOutput": "Zcut Resize Output",
 }

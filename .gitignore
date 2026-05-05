@@ -18,6 +18,7 @@ models/
 
 # Local ComfyUI outputs and examples not included in this repository
 workflows/
+codex_maintenance_guide/
 output/
 outputs/
 input/
@@ -31,4 +32,3 @@ tmp/
 .ruff_cache/
 .DS_Store
 Thumbs.db
-
