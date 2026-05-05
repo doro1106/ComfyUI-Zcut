@@ -1149,6 +1149,7 @@ class ZcutResizeOutput:
         return {
             "required": {
                 "image": ("IMAGE",),
+                "resize_output": ("BOOLEAN", {"default": True}),
                 "output_width": ("INT", {"default": 512, "min": 1, "max": 8192, "step": 1}),
                 "output_height": ("INT", {"default": 512, "min": 1, "max": 8192, "step": 1}),
                 "resample_method": (RESIZE_OUTPUT_RESAMPLE_METHODS, {"default": "auto"}),
@@ -1163,9 +1164,12 @@ class ZcutResizeOutput:
     FUNCTION = "run"
     CATEGORY = "Zcut"
 
-    def run(self, image, output_width, output_height, resample_method, mask=None):
-        resized_image = _resize_image_batch_to_canvas(image, output_width, output_height, resample_method)
+    def run(self, image, resize_output, output_width, output_height, resample_method, mask=None):
         source_mask = mask if mask is not None else _alpha_mask_from_image(image)
+        if not resize_output:
+            return image, source_mask
+
+        resized_image = _resize_image_batch_to_canvas(image, output_width, output_height, resample_method)
         resized_mask = _resize_mask_batch_to_canvas(source_mask, output_width, output_height, resample_method)
         return resized_image, resized_mask
 
@@ -1177,7 +1181,7 @@ class ZcutAddBackground:
             "required": {
                 "image": ("IMAGE",),
                 "background_mode": (["transparent", "image", "color"], {"default": "transparent"}),
-                "background_color": ("STRING", {"default": "#ffffff"}),
+                "background_color": ("COLOR", {"default": "#ffffff"}),
                 "background_fit": (["cover", "stretch"], {"default": "cover"}),
             },
             "optional": {

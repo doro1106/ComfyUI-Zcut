@@ -102,6 +102,7 @@ Resizes the final avatar after cropping.
 Inputs:
 
 - `image`: Cropped RGBA image.
+- `resize_output`: Enable final canvas resizing. Disable it to pass the image and mask through unchanged.
 - `output_width`, `output_height`: Final canvas size in pixels.
 - `resample_method`: Resize filter. `auto` uses `area` when scaling down and `lanczos` when scaling up. Manual options are `nearest-exact`, `bilinear`, `area`, `bicubic`, and `lanczos`.
 - `mask`: Optional mask to resize together with the image. If omitted, the image alpha channel is used.
@@ -146,7 +147,7 @@ Inputs:
 
 - `image`: Final image input.
 - `background_mode`: `transparent` keeps the transparent background, `image` composites over an uploaded background image, and `color` composites over a picked solid color.
-- `background_color`: Solid background color used by `color` mode. Enter a `#RRGGBB` color value or click the small swatch on the right to open ComfyUI's built-in color picker.
+- `background_color`: Solid background color used by `color` mode. This uses ComfyUI's native color picker and eyedropper.
 - `background_fit`: How uploaded background images fit the current image size: `cover` automatically scales and crops to fill, and `stretch` stretches to the exact size.
 - `background_mask`: Optional mask used to clip the added image/color background. Connect the crop node `shape_mask` output here to reuse the previous square/circle feather settings.
 - `background_image`: Optional uploaded background image used when `background_mode` is `image`.
@@ -283,6 +284,7 @@ ZCUT_SAM3_HF_REPOS=facebook/sam3,AB498/sam3
 输入：
 
 - `image`：裁切后的 RGBA 图像。
+- `resize_output`：是否启用最终画布尺寸调整。关闭时会直接透传图像和 mask，不改变尺寸。
 - `output_width`、`output_height`：最终画布尺寸，单位为像素。
 - `resample_method`：缩放重采样方式。`auto` 在缩小时使用 `area`，放大时使用 `lanczos`；也可以手动选择 `nearest-exact`、`bilinear`、`area`、`bicubic` 或 `lanczos`。
 - `mask`：可选，同步调整的 mask。如果不连接，会使用图像 alpha 通道。
@@ -326,7 +328,7 @@ ZCUT_SAM3_HF_REPOS=facebook/sam3,AB498/sam3
 
 - `image`：最终图像输入。
 - `background_mode`：`transparent` 保持透明背景，`image` 合成到上传背景图，`color` 合成到拾色器选择的纯色背景。
-- `background_color`：纯色背景颜色，可输入 `#RRGGBB` 格式的颜色值，也可点击右侧小色块打开 ComfyUI 自带拾色器。
+- `background_color`：纯色背景颜色，使用 ComfyUI 原生拾色器和吸管。
 - `background_fit`：上传背景图适配当前图像尺寸的方式：`cover` 自动缩放并裁切填满，`stretch` 拉伸到完全相同尺寸。
 - `background_mask`：可选，用于裁切图片/纯色背景的 mask。请连接裁切节点输出的 `shape_mask`，复用上一步的方形/圆形和羽化设置。
 - `background_image`：可选上传背景图，在 `background_mode` 为 `image` 时使用。
