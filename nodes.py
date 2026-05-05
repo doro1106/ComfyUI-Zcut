@@ -22,9 +22,16 @@ BIREFNET_DIR = PLUGIN_DIR / "models" / "BiRefNet"
 SAM3_DIR = PLUGIN_DIR / "models" / "sam3"
 SAM3_CHECKPOINT = SAM3_DIR / "sam3.pt"
 SAM3_BPE_PATH = SAM3_DIR / "assets" / "bpe_simple_vocab_16e6.txt.gz"
+SAM3_SOURCE_SENTINELS = (
+    SAM3_DIR / "__init__.py",
+    SAM3_DIR / "model_builder.py",
+    SAM3_DIR / "model" / "sam3_image_processor.py",
+)
 BIREFNET_HF_REPO = os.environ.get("ZCUT_BIREFNET_HF_REPO", "1038lab/BiRefNet")
 SAM3_HF_REPOS = [repo.strip() for repo in os.environ.get("ZCUT_SAM3_HF_REPOS", "facebook/sam3,AB498/sam3").split(",") if repo.strip()]
 UPSCALE_METHODS = ["nearest-exact", "bilinear", "area", "bicubic", "lanczos"]
+RESIZE_OUTPUT_RESAMPLE_METHODS = ["auto", *UPSCALE_METHODS]
+LARGE_MODEL_SUFFIXES = {".bin", ".ckpt", ".onnx", ".pt", ".safetensors"}
 
 BIREFNET_MODEL_CANDIDATES = {
     "BiRefNet-portrait": ("birefnet.py", "BiRefNet-portrait.safetensors", 1024),
@@ -243,6 +250,64 @@ def _download_hf_file(repo_id, filename, target_path):
     return target_path
 
 
+def _copy_hf_snapshot_without_weights(snapshot_path, target_dir):
+    snapshot_path = Path(snapshot_path)
+    target_dir = Path(target_dir)
+    target_dir.mkdir(parents=True, exist_ok=True)
+    for source_path in snapshot_path.rglob("*"):
+        if not source_path.is_file():
+            continue
+        if source_path.suffix.lower() in LARGE_MODEL_SUFFIXES:
+            continue
+        relative_path = source_path.relative_to(snapshot_path)
+        target_path = target_dir / relative_path
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source_path, target_path)
+
+
+def _sam3_source_is_available():
+    return all(path.exists() and path.stat().st_size > 0 for path in SAM3_SOURCE_SENTINELS)
+
+
+def _ensure_sam3_source_files():
+    if _sam3_source_is_available():
+        return
+
+    from huggingface_hub import snapshot_download
+
+    errors = []
+    allow_patterns = [
+        "*.py",
+        "assets/*",
+        "model/**/*.py",
+        "perflib/**/*.py",
+        "sam/**/*.py",
+        "train/**/*.py",
+    ]
+    ignore_patterns = ["*.bin", "*.ckpt", "*.onnx", "*.pt", "*.safetensors", "__pycache__/*"]
+    for repo_id in SAM3_HF_REPOS:
+        try:
+            print(f"[Zcut] Downloading SAM3 runtime source from {repo_id} -> {SAM3_DIR}")
+            snapshot_path = snapshot_download(
+                repo_id=repo_id,
+                allow_patterns=allow_patterns,
+                ignore_patterns=ignore_patterns,
+            )
+            _copy_hf_snapshot_without_weights(snapshot_path, SAM3_DIR)
+            if _sam3_source_is_available():
+                return
+            missing = ", ".join(str(path.relative_to(SAM3_DIR)) for path in SAM3_SOURCE_SENTINELS if not path.exists())
+            errors.append(f"{repo_id}: snapshot did not contain required files: {missing}")
+        except Exception as exc:
+            errors.append(f"{repo_id}: {exc}")
+
+    joined = "\n".join(errors)
+    raise RuntimeError(
+        "[Zcut] Failed to prepare SAM3 runtime source files. Check network access, Hugging Face access permissions, "
+        f"or set ZCUT_SAM3_HF_REPOS to a mirror that includes the SAM3 Python source.\n{joined}"
+    )
+
+
 def _ensure_hf_file(repo_id, filename, target_path):
     target_path = Path(target_path)
     if target_path.exists() and target_path.stat().st_size > 0:
@@ -267,6 +332,8 @@ def _ensure_birefnet_files(model_name):
 
 
 def _ensure_sam3_files():
+    _ensure_sam3_source_files()
+
     missing = []
     if not SAM3_CHECKPOINT.exists() or SAM3_CHECKPOINT.stat().st_size == 0:
         missing.append(("sam3.pt", SAM3_CHECKPOINT))
@@ -640,11 +707,20 @@ def _resize_rgb_exact(rgb, output_width, output_height, method):
     return np.clip(_resize_array_exact(rgb, output_width, output_height, method), 0.0, 1.0).astype(np.float32)
 
 
-def _resize_to_canvas(arr, output_width, output_height, interpolation, pad_value=0):
+def _canvas_resize_interpolation(width, height, resized_width, resized_height, resample_method):
+    if resample_method == "auto":
+        if resized_width < width or resized_height < height:
+            return cv2.INTER_AREA
+        return cv2.INTER_LANCZOS4
+    return _cv2_interpolation(resample_method)
+
+
+def _resize_to_canvas(arr, output_width, output_height, resample_method, pad_value=0):
     height, width = arr.shape[:2]
     scale = min(output_width / max(width, 1), output_height / max(height, 1))
     resized_width = max(1, int(round(width * scale)))
     resized_height = max(1, int(round(height * scale)))
+    interpolation = _canvas_resize_interpolation(width, height, resized_width, resized_height, resample_method)
     resized = cv2.resize(arr, (resized_width, resized_height), interpolation=interpolation)
 
     if arr.ndim == 2:
@@ -659,14 +735,13 @@ def _resize_to_canvas(arr, output_width, output_height, interpolation, pad_value
     return canvas
 
 
-def _resize_rgba_to_canvas(img, output_width, output_height):
-    interpolation = cv2.INTER_AREA if img.shape[0] > output_height else cv2.INTER_LINEAR
+def _resize_rgba_to_canvas(img, output_width, output_height, resample_method):
     alpha = np.clip(img[..., 3], 0.0, 1.0)
     rgb = np.clip(img[..., :3], 0.0, 1.0)
     premultiplied = rgb * alpha[..., None]
 
-    resized_rgb = _resize_to_canvas(premultiplied, output_width, output_height, interpolation)
-    resized_alpha = _resize_to_canvas(alpha, output_width, output_height, interpolation)
+    resized_rgb = _resize_to_canvas(premultiplied, output_width, output_height, resample_method)
+    resized_alpha = _resize_to_canvas(alpha, output_width, output_height, resample_method)
     safe_alpha = np.maximum(resized_alpha, 1e-6)
     straight_rgb = resized_rgb / safe_alpha[..., None]
     straight_rgb[resized_alpha <= 1e-6] = 0.0
@@ -674,26 +749,26 @@ def _resize_rgba_to_canvas(img, output_width, output_height):
     return np.dstack((np.clip(straight_rgb, 0.0, 1.0), np.clip(resized_alpha, 0.0, 1.0)))
 
 
-def _resize_image_batch_to_canvas(image, output_width, output_height):
+def _resize_image_batch_to_canvas(image, output_width, output_height, resample_method):
     arr = image.detach().cpu().numpy()
     if arr.ndim == 3:
         arr = arr[None,]
     arr = np.clip(arr, 0.0, 1.0).astype(np.float32)
     resized = [
-        _resize_rgba_to_canvas(img, output_width, output_height)
+        _resize_rgba_to_canvas(img, output_width, output_height, resample_method)
         if img.shape[-1] >= 4
-        else _resize_to_canvas(img, output_width, output_height, cv2.INTER_AREA if img.shape[0] > output_height else cv2.INTER_LINEAR)
+        else _resize_to_canvas(img, output_width, output_height, resample_method)
         for img in arr
     ]
     return torch.from_numpy(np.stack(resized, axis=0).astype(np.float32))
 
 
-def _resize_mask_batch_to_canvas(mask, output_width, output_height):
+def _resize_mask_batch_to_canvas(mask, output_width, output_height, resample_method):
     arr = mask.detach().cpu().numpy()
     if arr.ndim == 2:
         arr = arr[None,]
     arr = np.clip(arr, 0.0, 1.0).astype(np.float32)
-    resized = [_resize_to_canvas(single, output_width, output_height, cv2.INTER_LINEAR) for single in arr]
+    resized = [_resize_to_canvas(single, output_width, output_height, resample_method) for single in arr]
     return torch.from_numpy(np.stack(resized, axis=0).astype(np.float32))
 
 
@@ -1076,6 +1151,7 @@ class ZcutResizeOutput:
                 "image": ("IMAGE",),
                 "output_width": ("INT", {"default": 512, "min": 1, "max": 8192, "step": 1}),
                 "output_height": ("INT", {"default": 512, "min": 1, "max": 8192, "step": 1}),
+                "resample_method": (RESIZE_OUTPUT_RESAMPLE_METHODS, {"default": "auto"}),
             },
             "optional": {
                 "mask": ("MASK",),
@@ -1087,10 +1163,10 @@ class ZcutResizeOutput:
     FUNCTION = "run"
     CATEGORY = "Zcut"
 
-    def run(self, image, output_width, output_height, mask=None):
-        resized_image = _resize_image_batch_to_canvas(image, output_width, output_height)
+    def run(self, image, output_width, output_height, resample_method, mask=None):
+        resized_image = _resize_image_batch_to_canvas(image, output_width, output_height, resample_method)
         source_mask = mask if mask is not None else _alpha_mask_from_image(image)
-        resized_mask = _resize_mask_batch_to_canvas(source_mask, output_width, output_height)
+        resized_mask = _resize_mask_batch_to_canvas(source_mask, output_width, output_height, resample_method)
         return resized_image, resized_mask
 
 
@@ -1101,7 +1177,7 @@ class ZcutAddBackground:
             "required": {
                 "image": ("IMAGE",),
                 "background_mode": (["transparent", "image", "color"], {"default": "transparent"}),
-                "background_color": ("COLOR", {"default": "#ffffff"}),
+                "background_color": ("STRING", {"default": "#ffffff"}),
                 "background_fit": (["cover", "stretch"], {"default": "cover"}),
             },
             "optional": {

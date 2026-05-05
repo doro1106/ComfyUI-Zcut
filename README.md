@@ -45,12 +45,17 @@ The repository also excludes local workflow files and Codex maintenance scratch 
 On first use, the node can download the required files from Hugging Face:
 
 - BiRefNet files from `1038lab/BiRefNet`
-- SAM3 files from `facebook/sam3`, with `AB498/sam3` as a fallback source
+- SAM3 runtime source, checkpoint, and vocabulary from `facebook/sam3`, with `AB498/sam3` as a fallback source
+
+The SAM3 runtime source is copied without large model weight files. The checkpoint and vocabulary are downloaded separately into the expected local paths.
 
 For offline installation, place the files manually:
 
 ```text
 ComfyUI/custom_nodes/ComfyUI-Zcut/models/BiRefNet/*.safetensors
+ComfyUI/custom_nodes/ComfyUI-Zcut/models/sam3/__init__.py
+ComfyUI/custom_nodes/ComfyUI-Zcut/models/sam3/model_builder.py
+ComfyUI/custom_nodes/ComfyUI-Zcut/models/sam3/model/sam3_image_processor.py
 ComfyUI/custom_nodes/ComfyUI-Zcut/models/sam3/sam3.pt
 ComfyUI/custom_nodes/ComfyUI-Zcut/models/sam3/assets/bpe_simple_vocab_16e6.txt.gz
 ```
@@ -98,6 +103,7 @@ Inputs:
 
 - `image`: Cropped RGBA image.
 - `output_width`, `output_height`: Final canvas size in pixels.
+- `resample_method`: Resize filter. `auto` uses `area` when scaling down and `lanczos` when scaling up. Manual options are `nearest-exact`, `bilinear`, `area`, `bicubic`, and `lanczos`.
 - `mask`: Optional mask to resize together with the image. If omitted, the image alpha channel is used.
 
 Outputs:
@@ -140,7 +146,7 @@ Inputs:
 
 - `image`: Final image input.
 - `background_mode`: `transparent` keeps the transparent background, `image` composites over an uploaded background image, and `color` composites over a picked solid color.
-- `background_color`: Solid background color used by `color` mode. This uses ComfyUI's native color picker and eyedropper.
+- `background_color`: Solid background color used by `color` mode. Enter a `#RRGGBB` color value or click the small swatch on the right to open ComfyUI's built-in color picker.
 - `background_fit`: How uploaded background images fit the current image size: `cover` automatically scales and crops to fill, and `stretch` stretches to the exact size.
 - `background_mask`: Optional mask used to clip the added image/color background. Connect the crop node `shape_mask` output here to reuse the previous square/circle feather settings.
 - `background_image`: Optional uploaded background image used when `background_mode` is `image`.
@@ -220,12 +226,17 @@ GitHub 仓库中**不包含模型文件**。
 首次使用时，节点可以从 Hugging Face 自动下载所需文件：
 
 - BiRefNet 文件来自 `1038lab/BiRefNet`
-- SAM3 文件优先来自 `facebook/sam3`，并使用 `AB498/sam3` 作为备用来源
+- SAM3 运行源码、权重和词表优先来自 `facebook/sam3`，并使用 `AB498/sam3` 作为备用来源
+
+SAM3 运行源码会跳过大型模型权重文件复制；权重和词表会按固定路径单独下载。
 
 如果需要离线安装，请手动放置模型文件：
 
 ```text
 ComfyUI/custom_nodes/ComfyUI-Zcut/models/BiRefNet/*.safetensors
+ComfyUI/custom_nodes/ComfyUI-Zcut/models/sam3/__init__.py
+ComfyUI/custom_nodes/ComfyUI-Zcut/models/sam3/model_builder.py
+ComfyUI/custom_nodes/ComfyUI-Zcut/models/sam3/model/sam3_image_processor.py
 ComfyUI/custom_nodes/ComfyUI-Zcut/models/sam3/sam3.pt
 ComfyUI/custom_nodes/ComfyUI-Zcut/models/sam3/assets/bpe_simple_vocab_16e6.txt.gz
 ```
@@ -273,6 +284,7 @@ ZCUT_SAM3_HF_REPOS=facebook/sam3,AB498/sam3
 
 - `image`：裁切后的 RGBA 图像。
 - `output_width`、`output_height`：最终画布尺寸，单位为像素。
+- `resample_method`：缩放重采样方式。`auto` 在缩小时使用 `area`，放大时使用 `lanczos`；也可以手动选择 `nearest-exact`、`bilinear`、`area`、`bicubic` 或 `lanczos`。
 - `mask`：可选，同步调整的 mask。如果不连接，会使用图像 alpha 通道。
 
 输出：
@@ -314,7 +326,7 @@ ZCUT_SAM3_HF_REPOS=facebook/sam3,AB498/sam3
 
 - `image`：最终图像输入。
 - `background_mode`：`transparent` 保持透明背景，`image` 合成到上传背景图，`color` 合成到拾色器选择的纯色背景。
-- `background_color`：纯色背景颜色，使用 ComfyUI 原生拾色器和吸管。
+- `background_color`：纯色背景颜色，可输入 `#RRGGBB` 格式的颜色值，也可点击右侧小色块打开 ComfyUI 自带拾色器。
 - `background_fit`：上传背景图适配当前图像尺寸的方式：`cover` 自动缩放并裁切填满，`stretch` 拉伸到完全相同尺寸。
 - `background_mask`：可选，用于裁切图片/纯色背景的 mask。请连接裁切节点输出的 `shape_mask`，复用上一步的方形/圆形和羽化设置。
 - `background_image`：可选上传背景图，在 `background_mode` 为 `image` 时使用。
