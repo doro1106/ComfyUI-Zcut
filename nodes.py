@@ -1,4 +1,6 @@
 import importlib.util
+import hashlib
+import json
 import logging
 import math
 import os
@@ -13,7 +15,7 @@ import cv2
 import numpy as np
 import torch
 import torch.nn.functional as F
-from PIL import Image
+from PIL import Image, ImageOps, ImageSequence, UnidentifiedImageError
 from safetensors.torch import load_file
 from torchvision import transforms
 
@@ -32,6 +34,18 @@ SAM3_HF_REPOS = [repo.strip() for repo in os.environ.get("ZCUT_SAM3_HF_REPOS", "
 UPSCALE_METHODS = ["nearest-exact", "bilinear", "area", "bicubic", "lanczos"]
 RESIZE_OUTPUT_RESAMPLE_METHODS = ["auto", *UPSCALE_METHODS]
 LARGE_MODEL_SUFFIXES = {".bin", ".ckpt", ".onnx", ".pt", ".safetensors"}
+IMAGE_FILE_EXTENSIONS = {
+    ".avif",
+    ".bmp",
+    ".gif",
+    ".jpeg",
+    ".jpg",
+    ".jxl",
+    ".png",
+    ".tif",
+    ".tiff",
+    ".webp",
+}
 
 BIREFNET_MODEL_CANDIDATES = {
     "BiRefNet-portrait": ("birefnet.py", "BiRefNet-portrait.safetensors", 1024),
@@ -783,6 +797,257 @@ def _alpha_mask_from_image(image):
     return torch.from_numpy(np.clip(alpha, 0.0, 1.0).astype(np.float32))
 
 
+def _is_supported_image_path(path):
+    return Path(path).suffix.lower() in IMAGE_FILE_EXTENSIONS
+
+
+def _uploaded_image_ref_to_name(ref):
+    if isinstance(ref, dict):
+        name = str(ref.get("name", "")).strip()
+        subfolder = str(ref.get("subfolder", "")).strip()
+        upload_type = str(ref.get("type", "input")).strip() or "input"
+        if subfolder:
+            name = str(Path(subfolder) / name)
+        if upload_type in {"input", "output", "temp"}:
+            name = f"{name} [{upload_type}]"
+        return name
+    return str(ref).strip()
+
+
+def _parse_uploaded_image_refs(uploaded_images):
+    text = str(uploaded_images or "").strip()
+    if not text:
+        return []
+
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        data = [line.strip() for line in text.replace(";", "\n").splitlines() if line.strip()]
+
+    if isinstance(data, dict):
+        data = data.get("images", [])
+    if not isinstance(data, list):
+        raise ValueError("uploaded_images must be a JSON array or a newline-separated list.")
+
+    refs = [_uploaded_image_ref_to_name(item) for item in data]
+    return [ref for ref in refs if ref]
+
+
+def _discover_images_in_folder(folder_path, recursive, sort_order, image_load_limit):
+    root = Path(os.path.expandvars(os.path.expanduser(str(folder_path or "").strip()))).resolve()
+    if not root.is_dir():
+        raise ValueError(f"Folder path does not exist or is not a folder: {root}")
+
+    iterator = root.rglob("*") if recursive else root.iterdir()
+    paths = [path for path in iterator if path.is_file() and _is_supported_image_path(path)]
+    if sort_order == "modified_time":
+        paths.sort(key=lambda path: (path.stat().st_mtime, str(path).lower()))
+    else:
+        paths.sort(key=lambda path: str(path).lower())
+
+    limit = int(image_load_limit)
+    if limit > 0:
+        paths = paths[:limit]
+    return paths
+
+
+def _load_single_image_for_batch(path):
+    try:
+        img = Image.open(path)
+    except (OSError, UnidentifiedImageError):
+        return None
+
+    with img:
+        frame = next(ImageSequence.Iterator(img))
+        frame = ImageOps.exif_transpose(frame)
+        if frame.mode == "I":
+            frame = frame.point(lambda value: value * (1 / 255))
+
+        if "A" in frame.getbands():
+            alpha = np.array(frame.getchannel("A")).astype(np.float32) / 255.0
+        elif frame.mode == "P" and "transparency" in frame.info:
+            alpha = np.array(frame.convert("RGBA").getchannel("A")).astype(np.float32) / 255.0
+        else:
+            alpha = np.ones((frame.size[1], frame.size[0]), dtype=np.float32)
+
+        rgb = np.array(frame.convert("RGB")).astype(np.float32) / 255.0
+        mask = 1.0 - alpha
+        return np.clip(rgb, 0.0, 1.0).astype(np.float32), np.clip(mask, 0.0, 1.0).astype(np.float32)
+
+
+def _resize_loaded_image_to_size(rgb, mask, width, height):
+    rgb_resized = cv2.resize(rgb, (width, height), interpolation=cv2.INTER_AREA if rgb.shape[0] > height or rgb.shape[1] > width else cv2.INTER_LANCZOS4)
+    mask_resized = cv2.resize(mask, (width, height), interpolation=cv2.INTER_LINEAR)
+    return np.clip(rgb_resized, 0.0, 1.0).astype(np.float32), np.clip(mask_resized, 0.0, 1.0).astype(np.float32)
+
+
+def _pad_loaded_image_to_size(rgb, mask, width, height):
+    image_canvas = np.zeros((height, width, 3), dtype=np.float32)
+    mask_canvas = np.ones((height, width), dtype=np.float32)
+    source_height, source_width = rgb.shape[:2]
+    left = max(0, (width - source_width) // 2)
+    top = max(0, (height - source_height) // 2)
+    image_canvas[top : top + source_height, left : left + source_width] = rgb
+    mask_canvas[top : top + source_height, left : left + source_width] = mask
+    return image_canvas, mask_canvas
+
+
+def _make_loaded_image_batch(loaded_images, size_mode):
+    if not loaded_images:
+        raise ValueError("No valid images were loaded.")
+
+    if size_mode == "pad_to_largest":
+        target_width = max(rgb.shape[1] for rgb, _ in loaded_images)
+        target_height = max(rgb.shape[0] for rgb, _ in loaded_images)
+        normalized = [_pad_loaded_image_to_size(rgb, mask, target_width, target_height) for rgb, mask in loaded_images]
+        kept_indices = list(range(len(loaded_images)))
+    else:
+        target_height, target_width = loaded_images[0][0].shape[:2]
+        normalized = []
+        kept_indices = []
+        for index, (rgb, mask) in enumerate(loaded_images):
+            if rgb.shape[:2] == (target_height, target_width):
+                normalized.append((rgb, mask))
+                kept_indices.append(index)
+            elif size_mode == "resize_to_first":
+                normalized.append(_resize_loaded_image_to_size(rgb, mask, target_width, target_height))
+                kept_indices.append(index)
+
+    if not normalized:
+        raise ValueError("No images matched the selected size mode.")
+
+    images = torch.from_numpy(np.stack([rgb for rgb, _ in normalized], axis=0).astype(np.float32))
+    masks = torch.from_numpy(np.stack([mask for _, mask in normalized], axis=0).astype(np.float32))
+    return images, masks, kept_indices
+
+
+def _hash_image_paths(paths):
+    digest = hashlib.sha256()
+    for path in paths:
+        try:
+            stat = Path(path).stat()
+        except OSError:
+            continue
+        digest.update(str(Path(path)).encode("utf-8", errors="ignore"))
+        digest.update(str(stat.st_size).encode())
+        digest.update(str(stat.st_mtime_ns).encode())
+    return digest.hexdigest()
+
+
+class ZcutBatchLoadImages:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "upload_mode": (["multi_upload", "folder_path"], {"default": "multi_upload"}),
+                "uploaded_images": ("STRING", {"default": "[]", "multiline": False}),
+                "folder_path": ("STRING", {"default": "", "multiline": False}),
+                "recursive": ("BOOLEAN", {"default": False}),
+                "sort_order": (["name", "modified_time"], {"default": "name"}),
+                "size_mode": (["pad_to_largest", "resize_to_first", "skip_mismatched"], {"default": "pad_to_largest"}),
+                "image_load_limit": ("INT", {"default": 0, "min": 0, "max": 4096, "step": 1}),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE", "MASK", "STRING", "INT")
+    RETURN_NAMES = ("images", "masks", "file_paths", "count")
+    FUNCTION = "load_images"
+    CATEGORY = "Zcut"
+    SEARCH_ALIASES = ["batch load images", "multi image upload", "load images from folder", "批量上传图片", "批量加载图片"]
+
+    @classmethod
+    def IS_CHANGED(
+        cls,
+        upload_mode,
+        uploaded_images,
+        folder_path,
+        recursive,
+        sort_order,
+        size_mode,
+        image_load_limit,
+    ):
+        try:
+            if upload_mode == "folder_path":
+                paths = _discover_images_in_folder(folder_path, recursive, sort_order, image_load_limit)
+            else:
+                import folder_paths
+
+                refs = _parse_uploaded_image_refs(uploaded_images)
+                limit = int(image_load_limit)
+                if limit > 0:
+                    refs = refs[:limit]
+                paths = [Path(folder_paths.get_annotated_filepath(ref)) for ref in refs]
+            return _hash_image_paths(paths)
+        except Exception:
+            return hashlib.sha256(
+                f"{upload_mode}|{uploaded_images}|{folder_path}|{recursive}|{sort_order}|{size_mode}|{image_load_limit}".encode(
+                    "utf-8", errors="ignore"
+                )
+            ).hexdigest()
+
+    @classmethod
+    def VALIDATE_INPUTS(
+        cls,
+        upload_mode,
+        uploaded_images,
+        folder_path,
+        recursive,
+        sort_order,
+        size_mode,
+        image_load_limit,
+    ):
+        if upload_mode == "folder_path":
+            root = Path(os.path.expandvars(os.path.expanduser(str(folder_path or "").strip())))
+            if not root.is_dir():
+                return f"Invalid folder path: {folder_path}"
+        else:
+            try:
+                refs = _parse_uploaded_image_refs(uploaded_images)
+            except ValueError as exc:
+                return str(exc)
+            if not refs:
+                return "No uploaded images selected."
+        return True
+
+    def load_images(
+        self,
+        upload_mode,
+        uploaded_images,
+        folder_path,
+        recursive,
+        sort_order,
+        size_mode,
+        image_load_limit,
+    ):
+        if upload_mode == "folder_path":
+            paths = _discover_images_in_folder(folder_path, recursive, sort_order, image_load_limit)
+            display_paths = [str(path) for path in paths]
+        else:
+            import folder_paths
+
+            refs = _parse_uploaded_image_refs(uploaded_images)
+            limit = int(image_load_limit)
+            if limit > 0:
+                refs = refs[:limit]
+            paths = [Path(folder_paths.get_annotated_filepath(ref)) for ref in refs]
+            display_paths = refs
+
+        loaded_images = []
+        loaded_paths = []
+        for path, display_path in zip(paths, display_paths):
+            if not _is_supported_image_path(path):
+                continue
+            loaded = _load_single_image_for_batch(path)
+            if loaded is None:
+                continue
+            loaded_images.append(loaded)
+            loaded_paths.append(display_path)
+
+        images, masks, kept_indices = _make_loaded_image_batch(loaded_images, size_mode)
+        kept_paths = [loaded_paths[index] for index in kept_indices]
+        return images, masks, "\n".join(kept_paths), len(kept_paths)
+
+
 class ZcutBiRefNetSAM3FaceCrop:
     @classmethod
     def INPUT_TYPES(cls):
@@ -1234,6 +1499,7 @@ class ZcutAddBackground:
 
 
 NODE_CLASS_MAPPINGS = {
+    "ZcutBatchLoadImages": ZcutBatchLoadImages,
     "ZcutBiRefNetSAM3FaceCrop": ZcutBiRefNetSAM3FaceCrop,
     "ZcutAddBackground": ZcutAddBackground,
     "ZcutModelUpscale": ZcutModelUpscale,
@@ -1241,6 +1507,7 @@ NODE_CLASS_MAPPINGS = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
+    "ZcutBatchLoadImages": "Zcut Batch Load Images",
     "ZcutBiRefNetSAM3FaceCrop": "Zcut BiRefNet SAM3 Face Crop",
     "ZcutAddBackground": "Zcut Add Background",
     "ZcutModelUpscale": "Zcut Image Upscale",

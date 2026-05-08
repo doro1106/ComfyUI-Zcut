@@ -1,0 +1,1071 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ComfyUI-Zcut — AI 人像抠图与头像裁切插件</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&family=Noto+Sans+SC:wght@300;400;500;700&display=swap" rel="stylesheet">
+<style>
+*,*::before,*::after{margin:0;padding:0;box-sizing:border-box}
+:root{
+  --bg:#0a0b0f;
+  --bg-elevated:#12131a;
+  --bg-card:#16171f;
+  --bg-card-hover:#1c1d27;
+  --border:#2a2b38;
+  --border-light:#353648;
+  --text:#e8e9f0;
+  --text-secondary:#9496a8;
+  --text-muted:#5f6178;
+  --accent:#00d4aa;
+  --accent-dim:#00d4aa22;
+  --accent-glow:#00d4aa44;
+  --accent2:#6366f1;
+  --accent2-dim:#6366f122;
+  --accent3:#f59e0b;
+  --accent3-dim:#f59e0b22;
+  --danger:#ef4444;
+  --success:#22c55e;
+  --radius:12px;
+  --radius-sm:8px;
+  --radius-xs:6px;
+  --font-display:'Space Grotesk','Noto Sans SC',sans-serif;
+  --font-body:'Noto Sans SC','Space Grotesk',sans-serif;
+  --font-mono:'JetBrains Mono',monospace;
+  --transition:0.3s cubic-bezier(0.4,0,0.2,1);
+}
+html{scroll-behavior:smooth;font-size:16px}
+body{
+  font-family:var(--font-body);
+  background:var(--bg);
+  color:var(--text);
+  line-height:1.7;
+  overflow-x:hidden;
+  -webkit-font-smoothing:antialiased;
+}
+::selection{background:var(--accent);color:var(--bg)}
+::-webkit-scrollbar{width:6px}
+::-webkit-scrollbar-track{background:var(--bg)}
+::-webkit-scrollbar-thumb{background:var(--border-light);border-radius:3px}
+::-webkit-scrollbar-thumb:hover{background:var(--text-muted)}
+
+/* ── Noise overlay ── */
+body::before{
+  content:'';position:fixed;inset:0;z-index:9999;pointer-events:none;
+  opacity:0.025;
+  background-image:url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+  background-repeat:repeat;background-size:128px 128px;
+}
+
+/* ── Layout ── */
+.container{max-width:1200px;margin:0 auto;padding:0 24px}
+section{padding:80px 0}
+
+/* ── Nav ── */
+nav{
+  position:fixed;top:0;left:0;right:0;z-index:100;
+  background:rgba(10,11,15,0.8);backdrop-filter:blur(20px);
+  border-bottom:1px solid transparent;
+  transition:border-color var(--transition);
+}
+nav.scrolled{border-bottom-color:var(--border)}
+.nav-inner{
+  max-width:1200px;margin:0 auto;padding:0 24px;
+  display:flex;align-items:center;justify-content:space-between;
+  height:64px;
+}
+.nav-logo{
+  display:flex;align-items:center;gap:10px;
+  font-family:var(--font-display);font-weight:700;font-size:1.15rem;
+  color:var(--text);text-decoration:none;
+}
+.nav-logo-icon{
+  width:32px;height:32px;border-radius:var(--radius-xs);
+  background:linear-gradient(135deg,var(--accent),var(--accent2));
+  display:flex;align-items:center;justify-content:center;
+  font-size:0.85rem;font-weight:700;color:var(--bg);
+}
+.nav-links{display:flex;gap:32px;list-style:none}
+.nav-links a{
+  font-size:0.875rem;font-weight:500;color:var(--text-secondary);
+  text-decoration:none;transition:color var(--transition);position:relative;
+}
+.nav-links a:hover{color:var(--accent)}
+.nav-links a::after{
+  content:'';position:absolute;bottom:-4px;left:0;width:0;height:2px;
+  background:var(--accent);transition:width var(--transition);border-radius:1px;
+}
+.nav-links a:hover::after{width:100%}
+
+/* ── Hero ── */
+.hero{
+  min-height:100vh;display:flex;align-items:center;justify-content:center;
+  position:relative;overflow:hidden;padding-top:64px;
+}
+.hero-bg{
+  position:absolute;inset:0;z-index:0;
+  background:
+    radial-gradient(ellipse 80% 60% at 20% 40%, rgba(0,212,170,0.08) 0%, transparent 60%),
+    radial-gradient(ellipse 60% 50% at 80% 30%, rgba(99,102,241,0.06) 0%, transparent 60%),
+    radial-gradient(ellipse 50% 40% at 50% 80%, rgba(245,158,11,0.04) 0%, transparent 60%);
+}
+.hero-grid{
+  position:absolute;inset:0;z-index:0;
+  background-image:
+    linear-gradient(var(--border) 1px, transparent 1px),
+    linear-gradient(90deg, var(--border) 1px, transparent 1px);
+  background-size:80px 80px;
+  opacity:0.15;
+  mask-image:radial-gradient(ellipse 70% 60% at 50% 50%, black 20%, transparent 70%);
+  -webkit-mask-image:radial-gradient(ellipse 70% 60% at 50% 50%, black 20%, transparent 70%);
+}
+.hero-content{
+  position:relative;z-index:1;text-align:center;
+  max-width:800px;padding:0 24px;
+}
+.hero-badge{
+  display:inline-flex;align-items:center;gap:8px;
+  padding:6px 16px;border-radius:100px;
+  background:var(--accent-dim);border:1px solid rgba(0,212,170,0.2);
+  font-size:0.8rem;font-weight:500;color:var(--accent);
+  margin-bottom:32px;
+  animation:fadeUp 0.8s ease both;
+}
+.hero-badge-dot{
+  width:6px;height:6px;border-radius:50%;
+  background:var(--accent);
+  animation:pulse 2s ease-in-out infinite;
+}
+.hero h1{
+  font-family:var(--font-display);
+  font-size:clamp(2.8rem,6vw,4.5rem);
+  font-weight:700;line-height:1.1;letter-spacing:-0.03em;
+  margin-bottom:24px;
+  animation:fadeUp 0.8s ease 0.1s both;
+}
+.hero h1 .gradient-text{
+  background:linear-gradient(135deg,var(--accent) 0%,var(--accent2) 50%,var(--accent3) 100%);
+  -webkit-background-clip:text;-webkit-text-fill-color:transparent;
+  background-clip:text;
+}
+.hero-desc{
+  font-size:1.15rem;color:var(--text-secondary);
+  max-width:600px;margin:0 auto 40px;line-height:1.8;
+  animation:fadeUp 0.8s ease 0.2s both;
+}
+.hero-actions{
+  display:flex;gap:16px;justify-content:center;flex-wrap:wrap;
+  animation:fadeUp 0.8s ease 0.3s both;
+}
+.btn{
+  display:inline-flex;align-items:center;gap:8px;
+  padding:12px 28px;border-radius:var(--radius-sm);
+  font-family:var(--font-display);font-size:0.9rem;font-weight:600;
+  text-decoration:none;cursor:pointer;border:none;
+  transition:all var(--transition);
+}
+.btn-primary{
+  background:var(--accent);color:var(--bg);
+  box-shadow:0 0 24px var(--accent-glow);
+}
+.btn-primary:hover{
+  transform:translateY(-2px);
+  box-shadow:0 0 40px var(--accent-glow),0 8px 32px rgba(0,0,0,0.3);
+}
+.btn-secondary{
+  background:var(--bg-card);color:var(--text);
+  border:1px solid var(--border);
+}
+.btn-secondary:hover{
+  border-color:var(--accent);color:var(--accent);
+  transform:translateY(-2px);
+}
+.hero-stats{
+  display:flex;gap:48px;justify-content:center;margin-top:64px;
+  animation:fadeUp 0.8s ease 0.4s both;
+}
+.hero-stat{text-align:center}
+.hero-stat-value{
+  font-family:var(--font-display);font-size:2rem;font-weight:700;
+  color:var(--accent);
+}
+.hero-stat-label{
+  font-size:0.8rem;color:var(--text-muted);margin-top:4px;
+}
+
+/* ── Section headers ── */
+.section-header{text-align:center;margin-bottom:56px}
+.section-header h2{
+  font-family:var(--font-display);
+  font-size:clamp(1.8rem,3.5vw,2.5rem);
+  font-weight:700;letter-spacing:-0.02em;
+  margin-bottom:16px;
+}
+.section-header p{
+  font-size:1rem;color:var(--text-secondary);max-width:560px;margin:0 auto;
+}
+.section-tag{
+  display:inline-flex;align-items:center;gap:6px;
+  font-size:0.75rem;font-weight:600;text-transform:uppercase;
+  letter-spacing:0.1em;color:var(--accent);margin-bottom:12px;
+}
+.section-tag::before{
+  content:'';width:20px;height:1px;background:var(--accent);
+}
+
+/* ── Feature cards ── */
+.features-grid{
+  display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));
+  gap:20px;
+}
+.feature-card{
+  background:var(--bg-card);border:1px solid var(--border);
+  border-radius:var(--radius);padding:32px;
+  transition:all var(--transition);position:relative;overflow:hidden;
+}
+.feature-card::before{
+  content:'';position:absolute;top:0;left:0;right:0;height:2px;
+  background:linear-gradient(90deg,transparent,var(--accent),transparent);
+  opacity:0;transition:opacity var(--transition);
+}
+.feature-card:hover{
+  border-color:var(--border-light);
+  background:var(--bg-card-hover);
+  transform:translateY(-4px);
+  box-shadow:0 16px 48px rgba(0,0,0,0.3);
+}
+.feature-card:hover::before{opacity:1}
+.feature-icon{
+  width:48px;height:48px;border-radius:var(--radius-sm);
+  display:flex;align-items:center;justify-content:center;
+  font-size:1.3rem;margin-bottom:20px;
+}
+.feature-icon.teal{background:var(--accent-dim);color:var(--accent)}
+.feature-icon.indigo{background:var(--accent2-dim);color:var(--accent2)}
+.feature-icon.amber{background:var(--accent3-dim);color:var(--accent3)}
+.feature-card h3{
+  font-family:var(--font-display);font-size:1.1rem;font-weight:600;
+  margin-bottom:10px;
+}
+.feature-card p{
+  font-size:0.875rem;color:var(--text-secondary);line-height:1.7;
+}
+
+/* ── Nodes section ── */
+.nodes-section{background:var(--bg-elevated)}
+.nodes-grid{display:flex;flex-direction:column;gap:24px}
+.node-card{
+  background:var(--bg-card);border:1px solid var(--border);
+  border-radius:var(--radius);overflow:hidden;
+  transition:all var(--transition);
+}
+.node-card:hover{
+  border-color:var(--border-light);
+  box-shadow:0 8px 32px rgba(0,0,0,0.2);
+}
+.node-header{
+  display:flex;align-items:center;justify-content:space-between;
+  padding:20px 28px;cursor:pointer;
+  transition:background var(--transition);
+}
+.node-header:hover{background:var(--bg-card-hover)}
+.node-header-left{display:flex;align-items:center;gap:16px}
+.node-id{
+  font-family:var(--font-mono);font-size:0.7rem;font-weight:500;
+  color:var(--text-muted);background:var(--bg);
+  padding:4px 10px;border-radius:100px;border:1px solid var(--border);
+}
+.node-name{
+  font-family:var(--font-display);font-size:1rem;font-weight:600;
+}
+.node-toggle{
+  width:28px;height:28px;border-radius:50%;
+  background:var(--bg);border:1px solid var(--border);
+  display:flex;align-items:center;justify-content:center;
+  transition:all var(--transition);color:var(--text-muted);font-size:0.8rem;
+}
+.node-card.open .node-toggle{transform:rotate(180deg);color:var(--accent);border-color:var(--accent)}
+.node-body{
+  max-height:0;overflow:hidden;
+  transition:max-height 0.5s cubic-bezier(0.4,0,0.2,1);
+}
+.node-card.open .node-body{max-height:2000px}
+.node-body-inner{padding:0 28px 28px}
+.node-desc{
+  font-size:0.875rem;color:var(--text-secondary);
+  margin-bottom:20px;line-height:1.8;padding-top:4px;
+  border-top:1px solid var(--border);
+}
+.node-io{display:grid;grid-template-columns:1fr 1fr;gap:20px}
+.node-io-title{
+  font-family:var(--font-display);font-size:0.75rem;font-weight:600;
+  text-transform:uppercase;letter-spacing:0.08em;
+  color:var(--text-muted);margin-bottom:12px;
+  display:flex;align-items:center;gap:6px;
+}
+.node-io-title .dot{width:6px;height:6px;border-radius:50%}
+.node-io-title .dot.in{background:var(--accent)}
+.node-io-title .dot.out{background:var(--accent2)}
+.io-list{list-style:none;display:flex;flex-direction:column;gap:6px}
+.io-item{
+  display:flex;align-items:flex-start;gap:10px;
+  padding:8px 12px;border-radius:var(--radius-xs);
+  background:var(--bg);border:1px solid var(--border);
+  font-size:0.8rem;
+}
+.io-item-name{
+  font-family:var(--font-mono);font-weight:500;color:var(--text);
+  white-space:nowrap;
+}
+.io-item-type{
+  font-family:var(--font-mono);font-size:0.7rem;
+  color:var(--text-muted);margin-left:auto;white-space:nowrap;
+}
+.io-item-desc{
+  font-size:0.75rem;color:var(--text-secondary);
+  margin-top:2px;
+}
+
+/* ── Pipeline ── */
+.pipeline{position:relative}
+.pipeline-steps{display:flex;flex-direction:column;gap:0;position:relative}
+.pipeline-steps::before{
+  content:'';position:absolute;left:23px;top:40px;bottom:40px;
+  width:2px;
+  background:linear-gradient(to bottom,var(--accent),var(--accent2),var(--accent3));
+  opacity:0.3;
+}
+.pipeline-step{
+  display:flex;gap:24px;padding:24px 0;
+  opacity:0;transform:translateX(-20px);
+  transition:all 0.6s cubic-bezier(0.4,0,0.2,1);
+}
+.pipeline-step.visible{opacity:1;transform:translateX(0)}
+.pipeline-step-num{
+  width:48px;height:48px;min-width:48px;border-radius:50%;
+  display:flex;align-items:center;justify-content:center;
+  font-family:var(--font-display);font-weight:700;font-size:1rem;
+  position:relative;z-index:1;
+}
+.step-1 .pipeline-step-num{background:var(--accent-dim);color:var(--accent);border:2px solid var(--accent)}
+.step-2 .pipeline-step-num{background:var(--accent2-dim);color:var(--accent2);border:2px solid var(--accent2)}
+.step-3 .pipeline-step-num{background:var(--accent3-dim);color:var(--accent3);border:2px solid var(--accent3)}
+.step-4 .pipeline-step-num{background:rgba(239,68,68,0.12);color:var(--danger);border:2px solid var(--danger)}
+.step-5 .pipeline-step-num{background:rgba(34,197,94,0.12);color:var(--success);border:2px solid var(--success)}
+.pipeline-step-content{
+  background:var(--bg-card);border:1px solid var(--border);
+  border-radius:var(--radius);padding:24px;flex:1;
+  transition:all var(--transition);
+}
+.pipeline-step-content:hover{
+  border-color:var(--border-light);
+  box-shadow:0 4px 24px rgba(0,0,0,0.2);
+}
+.pipeline-step-content h3{
+  font-family:var(--font-display);font-size:1.05rem;font-weight:600;
+  margin-bottom:8px;
+}
+.pipeline-step-content p{
+  font-size:0.85rem;color:var(--text-secondary);line-height:1.7;
+}
+.pipeline-tech{
+  display:flex;gap:8px;margin-top:12px;flex-wrap:wrap;
+}
+.tech-tag{
+  font-family:var(--font-mono);font-size:0.7rem;
+  padding:3px 10px;border-radius:100px;
+  background:var(--bg);border:1px solid var(--border);
+  color:var(--text-muted);
+}
+
+/* ── Code block ── */
+.code-section{background:var(--bg-elevated)}
+.code-block-wrapper{
+  background:var(--bg-card);border:1px solid var(--border);
+  border-radius:var(--radius);overflow:hidden;
+}
+.code-block-header{
+  display:flex;align-items:center;justify-content:space-between;
+  padding:12px 20px;background:var(--bg);
+  border-bottom:1px solid var(--border);
+}
+.code-block-dots{display:flex;gap:6px}
+.code-block-dots span{
+  width:10px;height:10px;border-radius:50%;
+}
+.code-block-dots span:nth-child(1){background:#ef4444}
+.code-block-dots span:nth-child(2){background:#f59e0b}
+.code-block-dots span:nth-child(3){background:#22c55e}
+.code-block-lang{
+  font-family:var(--font-mono);font-size:0.75rem;color:var(--text-muted);
+}
+.code-block{
+  padding:20px;overflow-x:auto;
+  font-family:var(--font-mono);font-size:0.8rem;line-height:1.8;
+  color:var(--text-secondary);
+}
+.code-block .kw{color:var(--accent2)}
+.code-block .fn{color:var(--accent)}
+.code-block .str{color:var(--accent3)}
+.code-block .cmt{color:var(--text-muted);font-style:italic}
+.code-block .var{color:#e879f9}
+.code-block .num{color:#fb923c}
+
+/* ── Models ── */
+.models-grid{
+  display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));
+  gap:16px;
+}
+.model-card{
+  background:var(--bg-card);border:1px solid var(--border);
+  border-radius:var(--radius);padding:24px;
+  transition:all var(--transition);
+}
+.model-card:hover{
+  border-color:var(--border-light);
+  transform:translateY(-2px);
+}
+.model-card-header{display:flex;align-items:center;gap:12px;margin-bottom:12px}
+.model-badge{
+  font-family:var(--font-mono);font-size:0.65rem;font-weight:600;
+  padding:3px 8px;border-radius:4px;
+  text-transform:uppercase;letter-spacing:0.05em;
+}
+.model-badge.birefnet{background:var(--accent-dim);color:var(--accent)}
+.model-badge.sam3{background:var(--accent2-dim);color:var(--accent2)}
+.model-card h4{
+  font-family:var(--font-display);font-size:0.95rem;font-weight:600;
+}
+.model-card p{
+  font-size:0.8rem;color:var(--text-secondary);line-height:1.6;
+}
+.model-meta{
+  display:flex;gap:16px;margin-top:12px;
+  font-family:var(--font-mono);font-size:0.7rem;color:var(--text-muted);
+}
+
+/* ── Footer ── */
+footer{
+  border-top:1px solid var(--border);
+  padding:40px 0;text-align:center;
+}
+.footer-links{display:flex;gap:24px;justify-content:center;margin-bottom:20px;flex-wrap:wrap}
+.footer-links a{
+  font-size:0.85rem;color:var(--text-secondary);
+  text-decoration:none;transition:color var(--transition);
+}
+.footer-links a:hover{color:var(--accent)}
+.footer-copy{
+  font-size:0.75rem;color:var(--text-muted);
+}
+
+/* ── Animations ── */
+@keyframes fadeUp{
+  from{opacity:0;transform:translateY(24px)}
+  to{opacity:1;transform:translateY(0)}
+}
+@keyframes pulse{
+  0%,100%{opacity:1}
+  50%{opacity:0.4}
+}
+.fade-in{opacity:0;transform:translateY(24px);transition:all 0.7s cubic-bezier(0.4,0,0.2,1)}
+.fade-in.visible{opacity:1;transform:translateY(0)}
+
+/* ── Responsive ── */
+@media(max-width:768px){
+  .nav-links{display:none}
+  .hero-stats{gap:24px;flex-wrap:wrap}
+  .node-io{grid-template-columns:1fr}
+  .features-grid{grid-template-columns:1fr}
+  section{padding:56px 0}
+  .pipeline-steps::before{left:19px}
+  .pipeline-step-num{width:40px;height:40px;min-width:40px;font-size:0.85rem}
+}
+</style>
+</head>
+<body>
+
+<!-- Nav -->
+<nav id="nav">
+  <div class="nav-inner">
+    <a href="#" class="nav-logo">
+      <div class="nav-logo-icon">Z</div>
+      ComfyUI-Zcut
+    </a>
+    <ul class="nav-links">
+      <li><a href="#features">功能特性</a></li>
+      <li><a href="#nodes">节点说明</a></li>
+      <li><a href="#pipeline">工作流程</a></li>
+      <li><a href="#models">模型依赖</a></li>
+      <li><a href="#install">安装</a></li>
+    </ul>
+  </div>
+</nav>
+
+<!-- Hero -->
+<section class="hero">
+  <div class="hero-bg"></div>
+  <div class="hero-grid"></div>
+  <div class="hero-content">
+    <div class="hero-badge">
+      <span class="hero-badge-dot"></span>
+      ComfyUI Custom Node Plugin
+    </div>
+    <h1>
+      AI 人像抠图<br>
+      <span class="gradient-text">智能头像裁切</span>
+    </h1>
+    <p class="hero-desc">
+      结合 BiRefNet 前景提取与 SAM3 人脸定位，实现 Photoshop 级别的图层蒙版工作流——干净的人物抠图，配合羽化边缘的圆形或方形裁切，不拉伸、不模糊。
+    </p>
+    <div class="hero-actions">
+      <a href="https://github.com/doro1106/ComfyUI-Zcut" target="_blank" class="btn btn-primary">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0024 12c0-6.63-5.37-12-12-12z"/></svg>
+        GitHub 仓库
+      </a>
+      <a href="#install" class="btn btn-secondary">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+        快速安装
+      </a>
+    </div>
+    <div class="hero-stats">
+      <div class="hero-stat">
+        <div class="hero-stat-value">5</div>
+        <div class="hero-stat-label">核心节点</div>
+      </div>
+      <div class="hero-stat">
+        <div class="hero-stat-value">2</div>
+        <div class="hero-stat-label">AI 模型</div>
+      </div>
+      <div class="hero-stat">
+        <div class="hero-stat-value">6</div>
+        <div class="hero-stat-label">BiRefNet 变体</div>
+      </div>
+      <div class="hero-stat">
+        <div class="hero-stat-value">MIT</div>
+        <div class="hero-stat-label">开源协议</div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- Features -->
+<section id="features">
+  <div class="container">
+    <div class="section-header fade-in">
+      <div class="section-tag">Core Features</div>
+      <h2>功能特性</h2>
+      <p>从前景提取到最终输出，一站式人像头像处理工作流</p>
+    </div>
+    <div class="features-grid">
+      <div class="feature-card fade-in">
+        <div class="feature-icon teal">
+          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+        </div>
+        <h3>BiRefNet 前景抠图</h3>
+        <p>基于 BiRefNet 深度学习模型，精确提取人物前景。支持 6 种模型变体，从通用场景到专业肖像，覆盖不同使用需求。</p>
+      </div>
+      <div class="feature-card fade-in">
+        <div class="feature-icon indigo">
+          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+        </div>
+        <h3>SAM3 人脸定位</h3>
+        <p>利用 Meta SAM3 分割模型的文本提示能力，智能定位人脸/头部区域。支持多提示词组合，兼容真人、动漫、游戏角色等多种风格。</p>
+      </div>
+      <div class="feature-card fade-in">
+        <div class="feature-icon amber">
+          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>
+        </div>
+        <h3>PS 级裁切蒙版</h3>
+        <p>方形/圆形透明裁切，配合可调羽化边缘。只羽化裁切形状边缘，不模糊人物边缘——真正的 Photoshop 图层蒙版体验。</p>
+      </div>
+      <div class="feature-card fade-in">
+        <div class="feature-icon teal">
+          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="15 3 21 3 21 9"/><polyline points="9 21 3 21 3 15"/><line x1="21" y1="3" x2="14" y2="10"/><line x1="3" y1="21" x2="10" y2="14"/></svg>
+        </div>
+        <h3>无损缩放输出</h3>
+        <p>等比缩放到透明画布，不改变裁切形状、宽高比或透明背景。支持多种重采样方式，自动选择最优插值算法。</p>
+      </div>
+      <div class="feature-card fade-in">
+        <div class="feature-icon indigo">
+          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18"/><path d="M9 21V9"/></svg>
+        </div>
+        <h3>灵活背景合成</h3>
+        <p>保持透明、叠加背景图或填充纯色。智能检测不透明图像并跳过处理，支持 cover/stretch 两种背景适配模式。</p>
+      </div>
+      <div class="feature-card fade-in">
+        <div class="feature-icon amber">
+          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V9z"/><polyline points="13 2 13 9 20 9"/></svg>
+        </div>
+        <h3>批量图片加载</h3>
+        <p>支持多图上传和文件夹路径批量读取。自动处理尺寸不一致问题，输出标准 ComfyUI IMAGE/MASK batch，可连接任意节点。</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- Nodes -->
+<section id="nodes" class="nodes-section">
+  <div class="container">
+    <div class="section-header fade-in">
+      <div class="section-tag">Node Reference</div>
+      <h2>节点说明</h2>
+      <p>5 个核心节点，覆盖从图片加载到最终输出的完整链路</p>
+    </div>
+    <div class="nodes-grid">
+
+      <!-- Node 1 -->
+      <div class="node-card fade-in" data-node>
+        <div class="node-header" onclick="toggleNode(this)">
+          <div class="node-header-left">
+            <span class="node-id">ZcutBatchLoadImages</span>
+            <span class="node-name">批量图片加载</span>
+          </div>
+          <div class="node-toggle">▾</div>
+        </div>
+        <div class="node-body">
+          <div class="node-body-inner">
+            <p class="node-desc">通用批量图片加载节点。支持多图上传和文件夹路径读取，输出标准 ComfyUI IMAGE/MASK batch，可连接到其他原生或第三方节点。</p>
+            <div class="node-io">
+              <div>
+                <div class="node-io-title"><span class="dot in"></span>输入</div>
+                <ul class="io-list">
+                  <li class="io-item"><div><div class="io-item-name">upload_mode</div><div class="io-item-desc">multi_upload / folder_path</div></div><span class="io-item-type">COMBO</span></li>
+                  <li class="io-item"><div><div class="io-item-name">folder_path</div><div class="io-item-desc">文件夹路径（folder_path 模式）</div></div><span class="io-item-type">STRING</span></li>
+                  <li class="io-item"><div><div class="io-item-name">recursive</div><div class="io-item-desc">是否递归子文件夹</div></div><span class="io-item-type">BOOLEAN</span></li>
+                  <li class="io-item"><div><div class="io-item-name">size_mode</div><div class="io-item-desc">pad_to_largest / resize_to_first / skip_mismatched</div></div><span class="io-item-type">COMBO</span></li>
+                  <li class="io-item"><div><div class="io-item-name">image_load_limit</div><div class="io-item-desc">最大加载数量，0 为不限</div></div><span class="io-item-type">INT</span></li>
+                </ul>
+              </div>
+              <div>
+                <div class="node-io-title"><span class="dot out"></span>输出</div>
+                <ul class="io-list">
+                  <li class="io-item"><div class="io-item-name">images</div><span class="io-item-type">IMAGE</span></li>
+                  <li class="io-item"><div class="io-item-name">masks</div><span class="io-item-type">MASK</span></li>
+                  <li class="io-item"><div class="io-item-name">file_paths</div><span class="io-item-type">STRING</span></li>
+                  <li class="io-item"><div class="io-item-name">count</div><span class="io-item-type">INT</span></li>
+                </ul>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Node 2 -->
+      <div class="node-card fade-in" data-node>
+        <div class="node-header" onclick="toggleNode(this)">
+          <div class="node-header-left">
+            <span class="node-id">ZcutBiRefNetSAM3FaceCrop</span>
+            <span class="node-name">BiRefNet SAM3 人脸裁切</span>
+          </div>
+          <div class="node-toggle">▾</div>
+        </div>
+        <div class="node-body">
+          <div class="node-body-inner">
+            <p class="node-desc">核心节点。结合 BiRefNet 前景抠图与 SAM3 人脸定位，生成透明背景的人像/头像裁切图。支持方形/圆形裁切、边缘羽化、Alpha 去污染等高级功能。</p>
+            <div class="node-io">
+              <div>
+                <div class="node-io-title"><span class="dot in"></span>输入</div>
+                <ul class="io-list">
+                  <li class="io-item"><div><div class="io-item-name">image</div><div class="io-item-desc">ComfyUI 图像输入</div></div><span class="io-item-type">IMAGE</span></li>
+                  <li class="io-item"><div><div class="io-item-name">birefnet_model</div><div class="io-item-desc">BiRefNet 模型变体</div></div><span class="io-item-type">COMBO</span></li>
+                  <li class="io-item"><div><div class="io-item-name">crop_width / crop_height</div><div class="io-item-desc">裁切尺寸 (64–8192px)</div></div><span class="io-item-type">INT</span></li>
+                  <li class="io-item"><div><div class="io-item-name">shape</div><div class="io-item-desc">square / circle</div></div><span class="io-item-type">COMBO</span></li>
+                  <li class="io-item"><div><div class="io-item-name">feather_edges / feather_px</div><div class="io-item-desc">裁切边缘羽化开关及半径</div></div><span class="io-item-type">BOOL/INT</span></li>
+                  <li class="io-item"><div><div class="io-item-name">sam3_prompt</div><div class="io-item-desc">SAM3 定位提示词（逗号分隔）</div></div><span class="io-item-type">STRING</span></li>
+                  <li class="io-item"><div><div class="io-item-name">enable_cutout</div><div class="io-item-desc">是否启用 BiRefNet 抠图</div></div><span class="io-item-type">BOOLEAN</span></li>
+                  <li class="io-item"><div><div class="io-item-name">source_transparency_mask</div><div class="io-item-desc">可选，透明 PNG 的 alpha</div></div><span class="io-item-type">MASK</span></li>
+                </ul>
+              </div>
+              <div>
+                <div class="node-io-title"><span class="dot out"></span>输出</div>
+                <ul class="io-list">
+                  <li class="io-item"><div><div class="io-item-name">cropped_image</div><div class="io-item-desc">RGBA 透明背景裁切图</div></div><span class="io-item-type">IMAGE</span></li>
+                  <li class="io-item"><div><div class="io-item-name">crop_mask</div><div class="io-item-desc">最终 alpha mask</div></div><span class="io-item-type">MASK</span></li>
+                  <li class="io-item"><div><div class="io-item-name">birefnet_mask</div><div class="io-item-desc">BiRefNet 原始前景 mask</div></div><span class="io-item-type">MASK</span></li>
+                  <li class="io-item"><div><div class="io-item-name">shape_mask</div><div class="io-item-desc">裁切形状 mask（含羽化）</div></div><span class="io-item-type">MASK</span></li>
+                </ul>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Node 3 -->
+      <div class="node-card fade-in" data-node>
+        <div class="node-header" onclick="toggleNode(this)">
+          <div class="node-header-left">
+            <span class="node-id">ZcutResizeOutput</span>
+            <span class="node-name">最终尺寸调整</span>
+          </div>
+          <div class="node-toggle">▾</div>
+        </div>
+        <div class="node-body">
+          <div class="node-body-inner">
+            <p class="node-desc">裁切后调整最终头像输出尺寸。等比缩放并居中放入透明画布，不改变裁切形状、宽高比或透明背景。</p>
+            <div class="node-io">
+              <div>
+                <div class="node-io-title"><span class="dot in"></span>输入</div>
+                <ul class="io-list">
+                  <li class="io-item"><div><div class="io-item-name">image</div></div><span class="io-item-type">IMAGE</span></li>
+                  <li class="io-item"><div><div class="io-item-name">resize_output</div><div class="io-item-desc">启用/禁用缩放</div></div><span class="io-item-type">BOOLEAN</span></li>
+                  <li class="io-item"><div><div class="io-item-name">output_width / output_height</div></div><span class="io-item-type">INT</span></li>
+                  <li class="io-item"><div><div class="io-item-name">resample_method</div><div class="io-item-desc">auto / nearest / bilinear / area / bicubic / lanczos</div></div><span class="io-item-type">COMBO</span></li>
+                  <li class="io-item"><div><div class="io-item-name">mask</div><div class="io-item-desc">可选，同步缩放的 mask</div></div><span class="io-item-type">MASK</span></li>
+                </ul>
+              </div>
+              <div>
+                <div class="node-io-title"><span class="dot out"></span>输出</div>
+                <ul class="io-list">
+                  <li class="io-item"><div class="io-item-name">resized_image</div><span class="io-item-type">IMAGE</span></li>
+                  <li class="io-item"><div class="io-item-name">resized_mask</div><span class="io-item-type">MASK</span></li>
+                </ul>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Node 4 -->
+      <div class="node-card fade-in" data-node>
+        <div class="node-header" onclick="toggleNode(this)">
+          <div class="node-header-left">
+            <span class="node-id">ZcutModelUpscale</span>
+            <span class="node-name">图像超分放大</span>
+          </div>
+          <div class="node-toggle">▾</div>
+        </div>
+        <div class="node-body">
+          <div class="node-body-inner">
+            <p class="node-desc">使用 ComfyUI models/upscale_models 中的放大模型进行图像超分辨率或尺寸调整。支持超采样、倍数对齐等高级选项。</p>
+            <div class="node-io">
+              <div>
+                <div class="node-io-title"><span class="dot in"></span>输入</div>
+                <ul class="io-list">
+                  <li class="io-item"><div><div class="io-item-name">image</div></div><span class="io-item-type">IMAGE</span></li>
+                  <li class="io-item"><div><div class="io-item-name">upscale_model</div><div class="io-item-desc">放大模型名称</div></div><span class="io-item-type">COMBO</span></li>
+                  <li class="io-item"><div><div class="io-item-name">mode</div><div class="io-item-desc">rescale / resize</div></div><span class="io-item-type">COMBO</span></li>
+                  <li class="io-item"><div><div class="io-item-name">supersample</div><div class="io-item-desc">超采样至目标尺寸</div></div><span class="io-item-type">BOOLEAN</span></li>
+                </ul>
+              </div>
+              <div>
+                <div class="node-io-title"><span class="dot out"></span>输出</div>
+                <ul class="io-list">
+                  <li class="io-item"><div class="io-item-name">upscaled_image</div><span class="io-item-type">IMAGE</span></li>
+                  <li class="io-item"><div class="io-item-name">upscaled_mask</div><span class="io-item-type">MASK</span></li>
+                </ul>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Node 5 -->
+      <div class="node-card fade-in" data-node>
+        <div class="node-header" onclick="toggleNode(this)">
+          <div class="node-header-left">
+            <span class="node-id">ZcutAddBackground</span>
+            <span class="node-name">添加背景</span>
+          </div>
+          <div class="node-toggle">▾</div>
+        </div>
+        <div class="node-body">
+          <div class="node-body-inner">
+            <p class="node-desc">只在图像存在透明像素时添加背景。不透明图像直接透传。支持透明保持、背景图合成和纯色填充三种模式。</p>
+            <div class="node-io">
+              <div>
+                <div class="node-io-title"><span class="dot in"></span>输入</div>
+                <ul class="io-list">
+                  <li class="io-item"><div><div class="io-item-name">image</div></div><span class="io-item-type">IMAGE</span></li>
+                  <li class="io-item"><div><div class="io-item-name">background_mode</div><div class="io-item-desc">transparent / image / color</div></div><span class="io-item-type">COMBO</span></li>
+                  <li class="io-item"><div><div class="io-item-name">background_color</div><div class="io-item-desc">使用 ComfyUI 原生拾色器</div></div><span class="io-item-type">COLOR</span></li>
+                  <li class="io-item"><div><div class="io-item-name">background_fit</div><div class="io-item-desc">cover / stretch</div></div><span class="io-item-type">COMBO</span></li>
+                  <li class="io-item"><div><div class="io-item-name">background_mask</div><div class="io-item-desc">可选，裁切形状 mask</div></div><span class="io-item-type">MASK</span></li>
+                  <li class="io-item"><div><div class="io-item-name">background_image</div><div class="io-item-desc">可选，上传背景图</div></div><span class="io-item-type">IMAGE</span></li>
+                </ul>
+              </div>
+              <div>
+                <div class="node-io-title"><span class="dot out"></span>输出</div>
+                <ul class="io-list">
+                  <li class="io-item"><div class="io-item-name">image</div><span class="io-item-type">IMAGE</span></li>
+                  <li class="io-item"><div class="io-item-name">mask</div><span class="io-item-type">MASK</span></li>
+                </ul>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+    </div>
+  </div>
+</section>
+
+<!-- Pipeline -->
+<section id="pipeline">
+  <div class="container">
+    <div class="section-header fade-in">
+      <div class="section-tag">Workflow Pipeline</div>
+      <h2>工作流程</h2>
+      <p>从原始图片到最终头像，五个步骤完成专业级人像裁切</p>
+    </div>
+    <div class="pipeline">
+      <div class="pipeline-steps">
+        <div class="pipeline-step step-1">
+          <div class="pipeline-step-num">1</div>
+          <div class="pipeline-step-content">
+            <h3>加载图片</h3>
+            <p>通过 Zcut Batch Load Images 节点加载单张或多张图片。支持多图上传、文件夹路径批量读取，自动处理尺寸差异。</p>
+            <div class="pipeline-tech">
+              <span class="tech-tag">PIL / Pillow</span>
+              <span class="tech-tag">EXIF 自动校正</span>
+              <span class="tech-tag">RGBA Alpha 保留</span>
+            </div>
+          </div>
+        </div>
+        <div class="pipeline-step step-2">
+          <div class="pipeline-step-num">2</div>
+          <div class="pipeline-step-content">
+            <h3>前景抠图 + 人脸定位</h3>
+            <p>BiRefNet 提取人物前景 mask，SAM3 通过文本提示定位人脸/头部区域。评分系统综合位置、大小、肤色等因素选择最佳裁切中心。</p>
+            <div class="pipeline-tech">
+              <span class="tech-tag">BiRefNet</span>
+              <span class="tech-tag">SAM3</span>
+              <span class="tech-tag">PyTorch</span>
+              <span class="tech-tag">BFloat16 推理</span>
+            </div>
+          </div>
+        </div>
+        <div class="pipeline-step step-3">
+          <div class="pipeline-step-num">3</div>
+          <div class="pipeline-step-content">
+            <h3>裁切 + 形状蒙版</h3>
+            <p>以人脸为中心裁切指定尺寸，叠加方形或圆形裁切蒙版。边缘羽化只影响裁切形状，不模糊人物边缘。Alpha 边界自动去污染。</p>
+            <div class="pipeline-tech">
+              <span class="tech-tag">OpenCV</span>
+              <span class="tech-tag">Gaussian Blur 羽化</span>
+              <span class="tech-tag">Distance Transform 去污染</span>
+            </div>
+          </div>
+        </div>
+        <div class="pipeline-step step-4">
+          <div class="pipeline-step-num">4</div>
+          <div class="pipeline-step-content">
+            <h3>尺寸调整 / 超分放大</h3>
+            <p>可选步骤。使用 Zcut Resize Output 等比缩放到目标画布，或使用 Zcut Image Upscale 通过放大模型进行超分辨率增强。</p>
+            <div class="pipeline-tech">
+              <span class="tech-tag">Premultiplied Alpha</span>
+              <span class="tech-tag">Spandrel 模型加载</span>
+              <span class="tech-tag">Tiled 推理</span>
+            </div>
+          </div>
+        </div>
+        <div class="pipeline-step step-5">
+          <div class="pipeline-step-num">5</div>
+          <div class="pipeline-step-content">
+            <h3>背景合成输出</h3>
+            <p>最终步骤。保持透明背景、叠加背景图或填充纯色。智能检测不透明图像直接透传，支持 cover/stretch 背景适配。</p>
+            <div class="pipeline-tech">
+              <span class="tech-tag">Alpha 合成</span>
+              <span class="tech-tag">ComfyUI COLOR 拾色器</span>
+              <span class="tech-tag">RGB 清理</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- Models -->
+<section id="models" class="code-section">
+  <div class="container">
+    <div class="section-header fade-in">
+      <div class="section-tag">Model Dependencies</div>
+      <h2>模型依赖</h2>
+      <p>首次使用时自动从 Hugging Face 下载，也支持离线手动放置</p>
+    </div>
+    <div class="models-grid">
+      <div class="model-card fade-in">
+        <div class="model-card-header">
+          <span class="model-badge birefnet">BiRefNet</span>
+          <h4>BiRefNet-general</h4>
+        </div>
+        <p>通用前景提取模型，默认选项。适用于大多数场景的人物抠图。</p>
+        <div class="model-meta">
+          <span>分辨率: 1024px</span>
+          <span>格式: safetensors</span>
+        </div>
+      </div>
+      <div class="model-card fade-in">
+        <div class="model-card-header">
+          <span class="model-badge birefnet">BiRefNet</span>
+          <h4>BiRefNet-portrait</h4>
+        </div>
+        <p>专为人像优化的抠图模型，在人物边缘处理上更加精细。</p>
+        <div class="model-meta">
+          <span>分辨率: 1024px</span>
+          <span>格式: safetensors</span>
+        </div>
+      </div>
+      <div class="model-card fade-in">
+        <div class="model-card-header">
+          <span class="model-badge birefnet">BiRefNet</span>
+          <h4>BiRefNet-HR-matting</h4>
+        </div>
+        <p>高分辨率精细抠图模型，处理复杂背景和毛发细节。</p>
+        <div class="model-meta">
+          <span>分辨率: 2048px</span>
+          <span>格式: safetensors</span>
+        </div>
+      </div>
+      <div class="model-card fade-in">
+        <div class="model-card-header">
+          <span class="model-badge birefnet">BiRefNet</span>
+          <h4>BiRefNet_512x512</h4>
+        </div>
+        <p>轻量级快速抠图模型，适合对速度要求较高的场景。</p>
+        <div class="model-meta">
+          <span>分辨率: 512px</span>
+          <span>格式: safetensors</span>
+        </div>
+      </div>
+      <div class="model-card fade-in">
+        <div class="model-card-header">
+          <span class="model-badge sam3">SAM3</span>
+          <h4>SAM3 Image Model</h4>
+        </div>
+        <p>Meta SAM3 图像分割模型，通过文本提示定位人脸/头部区域，支持多提示词组合。</p>
+        <div class="model-meta">
+          <span>来源: facebook/sam3</span>
+          <span>备用: AB498/sam3</span>
+        </div>
+      </div>
+      <div class="model-card fade-in">
+        <div class="model-card-header">
+          <span class="model-badge sam3">SAM3</span>
+          <h4>SAM3 BPE 词表</h4>
+        </div>
+        <p>SAM3 文本编码器使用的 BPE 分词词表文件，支持文本提示解析。</p>
+        <div class="model-meta">
+          <span>文件: bpe_simple_vocab_16e6.txt.gz</span>
+          <span>大小: ~4MB</span>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- Install -->
+<section id="install">
+  <div class="container">
+    <div class="section-header fade-in">
+      <div class="section-tag">Installation</div>
+      <h2>快速安装</h2>
+      <p>三步完成安装，首次运行自动下载模型</p>
+    </div>
+    <div class="code-block-wrapper fade-in">
+      <div class="code-block-header">
+        <div class="code-block-dots"><span></span><span></span><span></span></div>
+        <span class="code-block-lang">bash</span>
+      </div>
+      <div class="code-block">
+<span class="cmt"># 1. 克隆到 ComfyUI 自定义节点目录</span>
+<span class="kw">cd</span> ComfyUI/custom_nodes
+git clone https://github.com/doro1106/ComfyUI-Zcut.git
+
+<span class="cmt"># 2. 安装 Python 依赖（也可让插件自动安装）</span>
+<span class="kw">cd</span> ComfyUI-Zcut
+pip install -r requirements.txt
+
+<span class="cmt"># 3. 重启 ComfyUI，首次使用节点时自动下载模型</span>
+<span class="cmt"># 模型来源：BiRefNet → 1038lab/BiRefNet</span>
+<span class="cmt">#          SAM3   → facebook/sam3 (备用: AB498/sam3)</span>
+
+<span class="cmt"># 可选：自定义 Hugging Face 镜像源</span>
+<span class="kw">export</span> <span class="var">ZCUT_BIREFNET_HF_REPO</span>=<span class="str">1038lab/BiRefNet</span>
+<span class="kw">export</span> <span class="var">ZCUT_SAM3_HF_REPOS</span>=<span class="str">facebook/sam3,AB498/sam3</span>
+      </div>
+    </div>
+
+    <div class="code-block-wrapper fade-in" style="margin-top:20px">
+      <div class="code-block-header">
+        <div class="code-block-dots"><span></span><span></span><span></span></div>
+        <span class="code-block-lang">python — requirements.txt</span>
+      </div>
+      <div class="code-block">
+transformers&gt;=<span class="num">4.39.0</span>
+timm
+opencv-python
+Pillow
+numpy
+safetensors
+huggingface-hub&gt;=<span class="num">0.19.0</span>
+hf-xet
+iopath&gt;=<span class="num">1.0.9</span>
+ftfy
+regex
+typing_extensions
+scipy
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- Footer -->
+<footer>
+  <div class="container">
+    <div class="footer-links">
+      <a href="https://github.com/doro1106/ComfyUI-Zcut" target="_blank">GitHub</a>
+      <a href="https://huggingface.co/1038lab/BiRefNet" target="_blank">BiRefNet Model</a>
+      <a href="https://huggingface.co/facebook/sam3" target="_blank">SAM3 Model</a>
+      <a href="https://huggingface.co/AB498/sam3" target="_blank">SAM3 Mirror</a>
+    </div>
+    <p class="footer-copy">ComfyUI-Zcut &copy; 2026 Zcut contributors — MIT License</p>
+  </div>
+</footer>
+
+<script>
+// Nav scroll effect
+const nav = document.getElementById('nav');
+window.addEventListener('scroll', () => {
+  nav.classList.toggle('scrolled', window.scrollY > 20);
+});
+
+// Toggle node cards
+function toggleNode(header) {
+  const card = header.closest('.node-card');
+  card.classList.toggle('open');
+}
+
+// Intersection Observer for fade-in animations
+const observer = new IntersectionObserver((entries) => {
+  entries.forEach((entry, i) => {
+    if (entry.isIntersecting) {
+      const delay = entry.target.dataset.delay || 0;
+      setTimeout(() => {
+        entry.target.classList.add('visible');
+      }, delay);
+      observer.unobserve(entry.target);
+    }
+  });
+}, { threshold: 0.1, rootMargin: '0px 0px -40px 0px' });
+
+// Observe fade-in elements
+document.querySelectorAll('.fade-in').forEach((el, i) => {
+  el.dataset.delay = (i % 6) * 80;
+  observer.observe(el);
+});
+
+// Observe pipeline steps
+document.querySelectorAll('.pipeline-step').forEach((el, i) => {
+  el.dataset.delay = i * 120;
+  observer.observe(el);
+});
+
+// Open first node card by default
+const firstNode = document.querySelector('.node-card');
+if (firstNode) firstNode.classList.add('open');
+</script>
+</body>
+</html>
