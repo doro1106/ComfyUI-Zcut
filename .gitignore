@@ -18,7 +18,7 @@ models/
 
 # Local ComfyUI outputs and examples not included in this repository
 workflows/
-HTML/
+web/
 CODEX_MAINTENANCE_GUIDE.zh-CN.md
 codex_maintenance_guide/
 output/
